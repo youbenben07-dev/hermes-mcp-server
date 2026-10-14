@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+.pytest_cache/
+
+# Venv
+venv/
+env/
+.venv/
+
+# OAuth 数据库 (含 token, 保密)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 配置/密钥
+.env
+*.pem
+*.key
+*.crt
+auth.json
+mcp_remote_token
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# OS
+Thumbs.db
+
+# 日志
+*.log
+bridge.log
+oauth.log
