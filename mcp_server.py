@@ -271,7 +271,7 @@ def tool_hermes_health_check(args: dict) -> dict:
             "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28",
         ],
         "default_protocol_version": "2026-07-28",
-        "tools_count": 6,
+        "tools_count": len(TOOLS),
         "tools": list(TOOLS.keys()),
         "server_time": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
         "server_host": "vps-racknerd (23.95.226.156)",
