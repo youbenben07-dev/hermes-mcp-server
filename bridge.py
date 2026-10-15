@@ -293,7 +293,8 @@ async def oauth_authorize_get(request: Request):
 
 @app.post("/oauth/authorize")
 async def oauth_authorize_post(request: Request):
-    """密码验证: 成功后给一次性 grant_token."""
+    """密码验证: Stage 3.7.1 - 密码对直接给 code (无 grant_token 中转, 消除超时 race).
+    实际 code 生成在 hermes_oauth.authorize_approve 中 (SQLite 持久化 + 5min 过期)."""
     try:
         form = await request.form()
     except Exception:
@@ -304,7 +305,6 @@ async def oauth_authorize_post(request: Request):
     code_challenge_method = form.get("code_challenge_method", "S256")
     state = form.get("state", "")
     scope = form.get("scope", "")
-    password = form.get("password", "")
 
     params, err, _ = hermes_oauth.authorize_validate(
         client_id, redirect_uri, code_challenge, code_challenge_method, state, scope
@@ -312,16 +312,15 @@ async def oauth_authorize_post(request: Request):
     if err:
         return HTMLResponse(hermes_oauth.authorize_page_html({}, error=err), status_code=400)
 
-    # 验证密码
+    # 验证密码 (3 次失败也直接返 401)
+    password = form.get("password", "")
     if not secrets.compare_digest(password, OAUTH_PASSWORD):
         log(f"[oauth] password FAIL for client={client_id[:8]}... (from {request.client.host})")
         return HTMLResponse(hermes_oauth.authorize_page_html_password(params, error="密码错误, 请重试"), status_code=401)
 
-    # 密码对 -> 给 grant_token, 重定向到 GET /oauth/authorize?grant_token=...
-    grant_token = hermes_oauth.create_grant_token(params)
-    log(f"[oauth] password OK, grant_token={grant_token[:8]}... client={client_id[:8]}...")
-    base_url = str(request.base_url).rstrip("/")
-    redirect = f"{base_url}/oauth/authorize?grant_token={grant_token}"
+    # 密码对 -> 直接生成 code + 302 redirect (省 grant_token 中转, 杜绝超时 race)
+    log(f"[oauth] password OK, 直接 code, client={client_id[:8]}... state={state[:8]}...")
+    redirect = hermes_oauth.authorize_approve(params)
     return RedirectResponse(redirect, status_code=302)
 
 

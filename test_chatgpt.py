@@ -67,34 +67,16 @@ status, h, body = req("POST", f"{BASE}/oauth/authorize", form=True, data={
 })
 check("5. 错密码 -> 401", status == 401, f"status={status}")
 
-# 6. 正确密码 -> 302 + grant_token
+# 6. 正确密码 -> 302 + code (Stage 3.7.1: 直接给 code, 无 grant_token 中转)
 status, h, body = req("POST", f"{BASE}/oauth/authorize", form=True, data={
     "client_id": client_id, "redirect_uri": REDIRECT,
     "code_challenge": challenge, "code_challenge_method": "S256",
     "state": "st123", "scope": "mcp:read", "password": "hermes-oauth-2026",
 })
 loc = h.get('Location', h.get('location', ''))
-check("6. 对密码 -> 302 + grant_token", status == 302 and "grant_token=" in loc, f"status={status}, loc={loc[:80]}")
-gt = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get('grant_token', [''])[0]
-
-# 7. 攻击测试: 任何人都能点允许? 不能 (需 grant_token)
-# 真实 GET /oauth/authorize?...&allowed=1 无 grant_token 应被 authorize_validate 拦截
-# (它会重走 GET, validate 接受所有参数, 然后因没有 grant_token 而走 authorize_page_html_password)
-aq_test = urllib.parse.urlencode({
-    "client_id": client_id, "redirect_uri": REDIRECT, "response_type": "code",
-    "code_challenge": challenge, "code_challenge_method": "S256", "scope": "mcp:read", "state": "st123",
-    "allowed": "1",  # 加 allowed=1, 但没 grant_token
-})
-status, h, body = req("GET", f"{BASE}/oauth/authorize?{aq_test}")
-# 期望: 200 (显示密码页, 而不是 302 给 code)
-is_password_page = "password" in body.lower() and "验证密码" in body
-check("7. allowed=1 无 grant_token 应显示密码页 (不直接给 code)", status == 200 and is_password_page, f"status={status}, password_page={is_password_page}")
-
-# 8. grant_token 允许 -> 302 + code + state
-status, h, body = req("GET", f"{BASE}/oauth/authorize?grant_token={gt}&allowed=1")
-loc2 = h.get('Location', h.get('location', ''))
-check("8. grant_token 允许 -> 302 + code + state", status == 302 and "code=" in loc2 and "state=st123" in loc2, f"loc={loc2[:100]}")
-code = urllib.parse.parse_qs(urllib.parse.urlparse(loc2).query).get('code', [''])[0]
+check("6. 对密码 -> 302 + code (直接)", status == 302 and "code=" in loc and "state=st123" in loc,
+      f"status={status}, loc={loc[:100]}")
+code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get('code', [''])[0]
 
 # 9. code -> token
 status, h, body = req("POST", f"{BASE}/oauth/token", form=True, data={

@@ -94,37 +94,65 @@ def verify_pkce(verifier: str, challenge: str, method: str = "S256") -> bool:
     computed = _b64url(hashlib.sha256(verifier.encode()).digest())
     return secrets.compare_digest(computed, challenge)
 
-# ── Grant token (Stage 3.7: 授权页密码保护) ────────
-_grant_tokens: dict = {}  # grant_token -> params (in-memory, 单进程够用)
+# ── Grant token (Stage 3.7.1: 持久化 + 容错) ─────
+# Stage 3.7 改为 SQLite 持久化 + 5 次使用限制 (容错)
+# grant_token: 5min 内可点 5 次 (含 1 次正常 + 4 次重试), 过期失效
 
 def create_grant_token(params: dict) -> str:
-    """授权页密码验证通过后, 创建一次性 grant_token (5min 过期, 单次使用)."""
+    """授权页密码验证通过后, 创建 grant_token (5min 过期, 最多 5 次使用)."""
     token = secrets.token_urlsafe(24)
-    _grant_tokens[token] = {
-        "params": params,
-        "created_at": _now(),
-        "expires_at": _now() + 300,  # 5min
-        "used": False,
-    }
-    # 定期清理过期
-    expired = [k for k, v in _grant_tokens.items() if v["expires_at"] < _now()]
-    for k in expired:
-        del _grant_tokens[k]
+    conn = _db()
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS grant_tokens (
+        token TEXT PRIMARY KEY,
+        client_id TEXT,
+        redirect_uri TEXT,
+        code_challenge TEXT,
+        code_challenge_method TEXT,
+        scope TEXT,
+        state TEXT,
+        expires_at INTEGER,
+        used_count INTEGER DEFAULT 0,
+        max_uses INTEGER DEFAULT 5
+    )""")
+    conn.execute(
+        "INSERT INTO grant_tokens (token, client_id, redirect_uri, code_challenge, code_challenge_method, scope, state, expires_at, used_count, max_uses) VALUES (?,?,?,?,?,?,?,?,0,5)",
+        (token, params["client_id"], params["redirect_uri"], params["code_challenge"],
+         params["code_challenge_method"], params["scope"], params["state"], _now() + 300),
+    )
+    # 清理过期
+    conn.execute("DELETE FROM grant_tokens WHERE expires_at < ?", (_now(),))
+    conn.commit()
+    conn.close()
     return token
 
 def consume_grant_token(token: str):
-    """验证 + 标记已用 + 返回参数 (单次使用)."""
-    if not token or token not in _grant_tokens:
+    """验证 + 标记已用 + 返回参数 (最多 N 次使用, 持久化)."""
+    if not token:
         return None
-    gt = _grant_tokens[token]
-    if gt["used"]:
-        del _grant_tokens[token]
+    conn = _db()
+    conn.execute("DELETE FROM grant_tokens WHERE expires_at < ?", (_now(),))
+    row = conn.execute("SELECT * FROM grant_tokens WHERE token=?", (token,)).fetchone()
+    if not row:
+        conn.close()
         return None
-    if gt["expires_at"] < _now():
-        del _grant_tokens[token]
+    if row["used_count"] >= row["max_uses"]:
+        conn.execute("DELETE FROM grant_tokens WHERE token=?", (token,))
+        conn.commit()
+        conn.close()
         return None
-    gt["used"] = True
-    return gt["params"]
+    # 递增 used_count
+    conn.execute("UPDATE grant_tokens SET used_count = used_count + 1 WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+    return {
+        "client_id": row["client_id"],
+        "redirect_uri": row["redirect_uri"],
+        "code_challenge": row["code_challenge"],
+        "code_challenge_method": row["code_challenge_method"],
+        "scope": row["scope"],
+        "state": row["state"],
+    }
 
 # ── OAuth 元数据 ───────────────────────────────────────
 def get_metadata():
