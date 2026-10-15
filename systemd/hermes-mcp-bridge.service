@@ -1,0 +1,18 @@
+[Unit]
+Description=Hermes MCP Remote Bridge (Streamable HTTP + OAuth)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/mcp_servers
+ExecStart=/home/hermes/.hermes/hermes-agent/venv/bin/python3 /home/hermes/mcp_servers/hermes_remote_bridge.py
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=HERMES_OAUTH_PASSWORD=hermes-oauth-2026
+# 静态 token 走文件读, 不设 env
+StandardOutput=append:/home/hermes/mcp_servers/bridge.log
+StandardError=append:/home/hermes/mcp_servers/bridge.log
+
+[Install]
+WantedBy=default.target

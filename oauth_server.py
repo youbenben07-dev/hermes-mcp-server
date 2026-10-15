@@ -94,6 +94,38 @@ def verify_pkce(verifier: str, challenge: str, method: str = "S256") -> bool:
     computed = _b64url(hashlib.sha256(verifier.encode()).digest())
     return secrets.compare_digest(computed, challenge)
 
+# ── Grant token (Stage 3.7: 授权页密码保护) ────────
+_grant_tokens: dict = {}  # grant_token -> params (in-memory, 单进程够用)
+
+def create_grant_token(params: dict) -> str:
+    """授权页密码验证通过后, 创建一次性 grant_token (5min 过期, 单次使用)."""
+    token = secrets.token_urlsafe(24)
+    _grant_tokens[token] = {
+        "params": params,
+        "created_at": _now(),
+        "expires_at": _now() + 300,  # 5min
+        "used": False,
+    }
+    # 定期清理过期
+    expired = [k for k, v in _grant_tokens.items() if v["expires_at"] < _now()]
+    for k in expired:
+        del _grant_tokens[k]
+    return token
+
+def consume_grant_token(token: str):
+    """验证 + 标记已用 + 返回参数 (单次使用)."""
+    if not token or token not in _grant_tokens:
+        return None
+    gt = _grant_tokens[token]
+    if gt["used"]:
+        del _grant_tokens[token]
+        return None
+    if gt["expires_at"] < _now():
+        del _grant_tokens[token]
+        return None
+    gt["used"] = True
+    return gt["params"]
+
 # ── OAuth 元数据 ───────────────────────────────────────
 def get_metadata():
     return {
@@ -263,19 +295,73 @@ def verify_access_token(token: str):
     return True, row["scope"]
 
 # ── 授权页 HTML ────────────────────────────────────────
+def _esc(s):
+    return (str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;"))
+
 def authorize_page_html(params, error=None):
+    """保留: 向后兼容 (已用 authorize_page_html_password 替代)"""
     if error:
         return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权失败</title></head>
 <body style="font-family:sans-serif;max-width:600px;margin:40px auto;text-align:center">
 <h2>授权失败</h2><p>{error}</p><p><a href="javascript:window.close()">关闭</a></p></body></html>"""
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>授权访问</title></head>
-<body style="font-family:sans-serif;max-width:600px;margin:40px auto;text-align:center">
-<h2>ChatGPT 请求访问 Hermes Dev Agent</h2>
-<p>请求的权限: <code>{params['scope']}</code></p>
-<p>客户端: <code>{params['client_id']}</code></p>
-<p style="color:#666">授权后 ChatGPT 可调用 Hermes 的 5 个只读工具 (系统状态 / ECS shell / 读文件 / git / 日志)。</p>
-<p><a href="/oauth/authorize?client_id={params['client_id']}&redirect_uri={params['redirect_uri']}&code_challenge={params['code_challenge']}&code_challenge_method={params['code_challenge_method']}&scope={params['scope']}&state={params['state']}&allowed=1" style="display:inline-block;padding:10px 24px;background:#10a37f;color:#fff;text-decoration:none;border-radius:6px;margin-right:12px">允许</a>
-<a href="/oauth/authorize?client_id={params['client_id']}&redirect_uri={params['redirect_uri']}&code_challenge={params['code_challenge']}&code_challenge_method={params['code_challenge_method']}&scope={params['scope']}&state={params['state']}&allowed=0" style="display:inline-block;padding:10px 24px;background:#f0f0f0;color:#333;text-decoration:none;border-radius:6px">拒绝</a></p>
+    return authorize_page_html_password(params)
+
+
+def authorize_page_html_password(params, error=None):
+    """Stage 3.7: 密码输入页 (防任意人点允许)"""
+    if error:
+        body_err = f'<p style="color:red">{_esc(error)}</p>'
+    else:
+        body_err = ""
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>Hermes OAuth 授权</title></head>
+<body style="font-family:sans-serif;max-width:500px;margin:60px auto;padding:20px">
+<h2>🔒 Hermes MCP 授权</h2>
+<p><strong>{_esc(params['client_id'])}</strong> 请求访问你的 Hermes Dev Agent</p>
+<p>请求 scope: <code>{_esc(params['scope'])}</code> (只读, 5 工具)</p>
+{body_err}
+<form method="POST" action="/oauth/authorize" style="margin-top:20px">
+  <input type="hidden" name="client_id" value="{_esc(params['client_id'])}">
+  <input type="hidden" name="redirect_uri" value="{_esc(params['redirect_uri'])}">
+  <input type="hidden" name="code_challenge" value="{_esc(params['code_challenge'])}">
+  <input type="hidden" name="code_challenge_method" value="{_esc(params['code_challenge_method'])}">
+  <input type="hidden" name="state" value="{_esc(params['state'])}">
+  <input type="hidden" name="scope" value="{_esc(params['scope'])}">
+  <p>输入 Hermes 授权密码 (只你/管理员知道):</p>
+  <input type="password" name="password" required autofocus
+         style="width:100%;padding:10px;margin:8px 0;border:1px solid #ccc;border-radius:4px">
+  <button type="submit" style="width:100%;padding:10px;background:#10a37f;color:#fff;border:none;border-radius:4px;cursor:pointer">
+    验证密码
+  </button>
+</form>
+<p style="color:#999;font-size:12px;margin-top:30px">
+  Stage 3.7 安全设计: 任意知道 OAuth URL 的人不能直接授权.
+  必须知道授权密码 (从 Hermes MCP 管理员处获得).
+</p>
+</body></html>"""
+
+
+def authorize_page_html_confirmed(params, grant_token):
+    """Stage 3.7: 密码验证后, 显示"允许/拒绝"按钮页"""
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><title>确认授权</title></head>
+<body style="font-family:sans-serif;max-width:500px;margin:60px auto;padding:20px;text-align:center">
+<h2>✅ 密码验证通过</h2>
+<p>客户端 <code>{_esc(params['client_id'])}</code> 想访问 Hermes Dev Agent</p>
+<p>权限: <code>{_esc(params['scope'])}</code> (只读)</p>
+<p>允许后 ChatGPT 可调用 5 个只读工具 (系统状态 / ECS shell / 读文件 / git / 日志)。</p>
+<p style="margin-top:30px">
+  <a href="/oauth/authorize?grant_token={_esc(grant_token)}&allowed=1"
+     style="display:inline-block;padding:12px 24px;background:#10a37f;color:#fff;text-decoration:none;border-radius:6px;margin-right:12px;font-weight:bold">
+    允许
+  </a>
+  <a href="/oauth/authorize?grant_token={_esc(grant_token)}&allowed=0"
+     style="display:inline-block;padding:12px 24px;background:#f0f0f0;color:#333;text-decoration:none;border-radius:6px">
+    拒绝
+  </a>
+</p>
+<p style="color:#999;font-size:12px;margin-top:40px">
+  ⚠️ 允许后 30 天内无需重新授权 (refresh_token 自动续期).
+  想撤销? 联系 Hermes 管理员删除 OAuth DB 中的 token 记录.
+</p>
 </body></html>"""
 
 

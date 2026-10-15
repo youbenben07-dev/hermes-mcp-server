@@ -1,0 +1,48 @@
+{
+    admin off
+    email admin@toothingbeginning.com
+}
+
+# MCP 命名站点 (Let's Encrypt 自动证书)
+mcp.hermes.toothingbeginning.com {
+    @mcp {
+        path /mcp* /oauth* /.well-known/*
+    }
+    handle @mcp {
+        # health_uri 检查 upstream, 不可用时主动返回 503
+        reverse_proxy 127.0.0.1:8443 {
+            health_uri /health
+            health_interval 5s
+            health_timeout 2s
+            health_status 200
+            # upstream 死时返回 503 而不是 502
+            lb_policy least_conn
+        }
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8443 {
+            health_uri /health
+            health_interval 5s
+            health_timeout 2s
+        }
+    }
+}
+
+# IP 站点 (显式 IP 证书, webhook + dashboard)
+https://23.95.226.156 {
+    tls /etc/caddy/certs/fullchain.pem /etc/caddy/certs/privkey.pem
+    @webhook {
+        path /webhook/*
+    }
+    handle @webhook {
+        reverse_proxy 127.0.0.1:5051
+    }
+    handle {
+        reverse_proxy 127.0.0.1:5050
+    }
+}
+
+# HTTP (dashboard + ACME challenge)
+:80 {
+    reverse_proxy 127.0.0.1:5050
+}

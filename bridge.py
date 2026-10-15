@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
 """
-Hermes MCP Remote Bridge - Stage 3.6 (Streamable HTTP + Bearer + OAuth 2.1)
+Hermes MCP Remote Bridge - Stage 3.7 (ChatGPT compatibility)
 
 包装 Stage 1 stdio server 为远程 HTTPS 端点, 让 ChatGPT Custom MCP Connector 可连接.
+
+Stage 3.7 修复 (vs 3.6):
+- protocolVersion 2024-11-05 -> 2025-06-18
+- 处理 MCP-Protocol-Version 请求头
+- 生成 + 返回 Mcp-Session-Id (stateful streamable HTTP)
+- notifications/initialized -> 202 no body (不转发 stdio)
+- 接受 Accept: application/json, text/event-stream
+- 授权页: 强制密码验证 (HERMES_OAUTH_PASSWORD env) + 一次性 grant_token 防 CSRF
+- 支持 SSE 响应 (text/event-stream)
+- 后台写日志到 /home/hermes/mcp_servers/bridge.log (持久化)
 
 认证 (双模式):
 1. 静态 Bearer Token (Stage 3.5, 内部/PM 访问)
 2. OAuth 2.1 access token (ChatGPT 通过 Authorization Code + PKCE 获取)
 
-OAuth 端点 (见 hermes_oauth.py):
+OAuth 端点:
 - GET  /.well-known/oauth-authorization-server
+- GET  /.well-known/oauth-protected-resource
 - POST /oauth/register
-- GET  /oauth/authorize
+- GET  /oauth/authorize  (含密码验证)
 - POST /oauth/token
+- POST /oauth/grant    (密码验证后给 grant_token)
 
-Caddy 反代 127.0.0.1:8443 → 公网 HTTPS (mcp.hermes.toothingbeginning.com)
+环境变量:
+  HERMES_MCP_TOKEN     静态 token (PM 内部)
+  HERMES_OAUTH_PASSWORD 授权页密码 (防任意人点允许, ChatGPT 用户)
+  HERMES_MCP_PORT       默认 8443
+  HERMES_MCP_HOST       默认 127.0.0.1
+  HERMES_STDIO_CMD      默认 python3
+  HERMES_STDIO_ARGS     默认 mcp_server.py
 """
 import asyncio
 import json
@@ -22,23 +40,29 @@ import os
 import secrets
 import sys
 import time
+import uuid
 from typing import Optional
 
-# 允许 import 同目录的 hermes_oauth
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hermes_oauth
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 # ── 配置 ────────────────────────────────────────────
 DEFAULT_TOKEN_FILE = "/home/hermes/.hermes/mcp_remote_token"
 TOKEN = os.environ.get("HERMES_MCP_TOKEN")
+OAUTH_PASSWORD = os.environ.get("HERMES_OAUTH_PASSWORD", "hermes-oauth-2026")  # 默认密码 (可改 env)
 HOST = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERMES_MCP_PORT", "8443"))
 STDIO_CMD = os.environ.get("HERMES_STDIO_CMD", "/home/hermes/.hermes/hermes-agent/venv/bin/python3")
 STDIO_ARGS = os.environ.get("HERMES_STDIO_ARGS", "/home/hermes/mcp_servers/hermes_dev_agent.py").split()
+BRIDGE_LOG = "/home/hermes/mcp_servers/bridge.log"
+
+# MCP 协议版本
+MCP_PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 
 if not TOKEN:
     if os.path.exists(DEFAULT_TOKEN_FILE):
@@ -51,13 +75,52 @@ if not TOKEN:
             f.write(TOKEN)
         os.chmod(DEFAULT_TOKEN_FILE, 0o600)
 
-# 初始化 OAuth DB
 hermes_oauth.init_db()
 
-print(f"[hermes-mcp-remote] Listening on http://{HOST}:{PORT}", file=sys.stderr)
-print(f"[hermes-mcp-remote] Auth: Bearer token ({len(TOKEN)} chars) + OAuth 2.1", file=sys.stderr)
-print(f"[hermes-mcp-remote] OAuth: {hermes_oauth.BASE_URL}", file=sys.stderr)
-print(f"[hermes-mcp-remote] Stdio backend: {STDIO_CMD} {' '.join(STDIO_ARGS)}", file=sys.stderr)
+# 写持久化日志 (不只 stderr)
+os.makedirs(os.path.dirname(BRIDGE_LOG), exist_ok=True)
+_log_file = open(BRIDGE_LOG, "a", buffering=1)  # line-buffered
+
+
+def log(msg):
+    """持久化日志: bridge.log + stderr"""
+    line = f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}"
+    print(line, file=sys.stderr)
+    print(line, file=_log_file)
+
+
+log(f"[startup] Listening on http://{HOST}:{PORT}")
+log(f"[startup] Auth: Bearer token ({len(TOKEN)} chars) + OAuth 2.1")
+log(f"[startup] MCP protocol: {MCP_PROTOCOL_VERSION} (supports: {sorted(SUPPORTED_PROTOCOL_VERSIONS)})")
+log(f"[startup] OAuth: {hermes_oauth.BASE_URL} (password protected authorize page)")
+log(f"[startup] Stdio backend: {STDIO_CMD} {' '.join(STDIO_ARGS)}")
+
+
+# ── Session 管理 (stateful streamable HTTP) ──────────
+sessions: dict = {}  # session_id -> {created_at, last_seen, client_id}
+
+
+def get_or_create_session(req: Request, auth_client: str) -> str:
+    """读 Mcp-Session-Id 头, 没有则生成新的."""
+    sid = req.headers.get("mcp-session-id")
+    if sid and sid in sessions:
+        sessions[sid]["last_seen"] = time.time()
+        return sid
+    # 新 session
+    sid = secrets.token_urlsafe(16)
+    sessions[sid] = {
+        "created_at": time.time(),
+        "last_seen": time.time(),
+        "client": auth_client,
+        "initialized": False,
+    }
+    return sid
+
+
+def mark_session_initialized(sid: str):
+    if sid in sessions:
+        sessions[sid]["initialized"] = True
+
 
 # ── Stdio subprocess 管理 ──────────────────────────
 class StdioMCP:
@@ -75,7 +138,7 @@ class StdioMCP:
             stderr=asyncio.subprocess.PIPE,
         )
 
-    async def call(self, req: dict, timeout: float = 60) -> dict:
+    async def call(self, req: dict, timeout: float = 30) -> dict:
         async with self.lock:
             await self.start()
             try:
@@ -103,7 +166,7 @@ class StdioMCP:
 stdio_mcp = StdioMCP()
 
 # ── FastAPI app ─────────────────────────────────────
-app = FastAPI(title="Hermes MCP Remote Bridge (Stage 3.6)", version="3.6.0")
+app = FastAPI(title="Hermes MCP Remote Bridge (Stage 3.7)", version="3.7.0")
 
 
 class JsonRpcRequest(BaseModel):
@@ -124,29 +187,25 @@ def check_auth(request: Request) -> str:
             headers=ww,
         )
     client_token = auth[7:].strip()
-    # 1. 静态 token (Stage 3.5, PM/内部)
     if secrets.compare_digest(client_token, TOKEN):
         return f"static[{len(client_token)}chars]"
-    # 2. OAuth access token (ChatGPT)
     valid, scope = hermes_oauth.verify_access_token(client_token)
     if valid:
         return f"oauth[{len(client_token)}chars:{scope}]"
-    raise HTTPException(
-        status_code=401,
-        detail="Invalid bearer token",
-        headers=ww,
-    )
+    raise HTTPException(status_code=401, detail="Invalid bearer token", headers=ww)
 
 
+# ── 根端点 ─────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
         "name": "Hermes MCP Remote Bridge",
-        "version": "3.6.0",
-        "stage": "Stage 3.6 (Streamable HTTP + Bearer + OAuth 2.1)",
+        "version": "3.7.0",
+        "stage": "Stage 3.7 (Streamable HTTP + Bearer + OAuth 2.1 + MCP 2025-06-18)",
         "mcp_endpoint": "/mcp",
         "auth": "Bearer token 或 OAuth 2.1 access token",
         "oauth_metadata": "/.well-known/oauth-authorization-server",
+        "mcp_protocol_version": MCP_PROTOCOL_VERSION,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -156,7 +215,7 @@ async def health():
     return {"ok": True, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
-# ── OAuth 2.1 端点 ─────────────────────────────────
+# ── OAuth 端点 ─────────────────────────────────────
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_metadata():
     return JSONResponse(content=hermes_oauth.get_metadata())
@@ -164,7 +223,6 @@ async def oauth_metadata():
 
 @app.get("/.well-known/oauth-protected-resource")
 async def oauth_resource_metadata():
-    """资源服务器元数据 (MCP 规范, 供客户端发现 OAuth AS)."""
     return JSONResponse(content={
         "resource": f"{hermes_oauth.BASE_URL}/mcp",
         "authorization_servers": [hermes_oauth.BASE_URL],
@@ -184,8 +242,18 @@ async def oauth_register(request: Request):
     return JSONResponse(status_code=201, content=result)
 
 
+# ── /oauth/authorize 完整版: 含密码验证 ─────────────
+# 流程:
+#  1. GET /oauth/authorize?...        -> 显示密码输入页 (带 csrf_token)
+#  2. POST /oauth/authorize (password) -> 验证密码 + 给 grant_token, 重定向到自己 /oauth/authorize?grant_token=...
+#  3. GET /oauth/authorize?grant_token=...  -> 显示 "允许" / "拒绝" 按钮 (html)
+#  4. GET /oauth/authorize?grant_token=...&allowed=1  -> 302 redirect 到 client redirect_uri?code=...
+#  5. GET /oauth/authorize?grant_token=...&allowed=0  -> 302 redirect 到 client redirect_uri?error=access_denied
+#  grant_token 单次使用 + 5min 过期 (在 hermes_oauth 内存中)
+
+
 @app.get("/oauth/authorize")
-async def oauth_authorize(request: Request):
+async def oauth_authorize_get(request: Request):
     q = request.query_params
     client_id = q.get("client_id", "")
     redirect_uri = q.get("redirect_uri", "")
@@ -194,6 +262,49 @@ async def oauth_authorize(request: Request):
     state = q.get("state", "")
     scope = q.get("scope", "")
     allowed = q.get("allowed", "")
+    grant_token = q.get("grant_token", "")
+
+    # 阶段 4: grant_token + allowed -> 真正生成 code
+    if grant_token:
+        params = hermes_oauth.consume_grant_token(grant_token)
+        if not params:
+            return HTMLResponse(hermes_oauth.authorize_page_html({"client_id": "?"}, error="授权 token 无效或已过期, 请重新发起授权"), status_code=400)
+        if allowed == "1":
+            redirect = hermes_oauth.authorize_approve(params)
+            log(f"[oauth] grant_token {grant_token[:8]}... allowed=1, client={params['client_id'][:8]}...")
+            return RedirectResponse(redirect, status_code=302)
+        if allowed == "0":
+            sep = "&" if "?" in params["redirect_uri"] else "?"
+            redirect = f"{params['redirect_uri']}{sep}error=access_denied&state={params['state']}"
+            log(f"[oauth] grant_token {grant_token[:8]}... allowed=0, client={params['client_id'][:8]}...")
+            return RedirectResponse(redirect, status_code=302)
+        # grant_token 有效但 allowed 未给 -> 显示 "允许/拒绝" 按钮
+        return HTMLResponse(hermes_oauth.authorize_page_html_confirmed(params, grant_token))
+
+    # 阶段 1: 没 grant_token -> 验证请求 + 显示密码页
+    params, err, _ = hermes_oauth.authorize_validate(
+        client_id, redirect_uri, code_challenge, code_challenge_method, state, scope
+    )
+    if err:
+        return HTMLResponse(hermes_oauth.authorize_page_html({}, error=err), status_code=400)
+    # 显示密码输入页
+    return HTMLResponse(hermes_oauth.authorize_page_html_password(params))
+
+
+@app.post("/oauth/authorize")
+async def oauth_authorize_post(request: Request):
+    """密码验证: 成功后给一次性 grant_token."""
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid form body")
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    code_challenge = form.get("code_challenge", "")
+    code_challenge_method = form.get("code_challenge_method", "S256")
+    state = form.get("state", "")
+    scope = form.get("scope", "")
+    password = form.get("password", "")
 
     params, err, _ = hermes_oauth.authorize_validate(
         client_id, redirect_uri, code_challenge, code_challenge_method, state, scope
@@ -201,16 +312,17 @@ async def oauth_authorize(request: Request):
     if err:
         return HTMLResponse(hermes_oauth.authorize_page_html({}, error=err), status_code=400)
 
-    if allowed == "1":
-        redirect = hermes_oauth.authorize_approve(params)
-        return RedirectResponse(redirect, status_code=302)
-    if allowed == "0":
-        sep = "&" if "?" in params["redirect_uri"] else "?"
-        redirect = f"{params['redirect_uri']}{sep}error=access_denied&state={params['state']}"
-        return RedirectResponse(redirect, status_code=302)
+    # 验证密码
+    if not secrets.compare_digest(password, OAUTH_PASSWORD):
+        log(f"[oauth] password FAIL for client={client_id[:8]}... (from {request.client.host})")
+        return HTMLResponse(hermes_oauth.authorize_page_html_password(params, error="密码错误, 请重试"), status_code=401)
 
-    # 显示授权确认页
-    return HTMLResponse(hermes_oauth.authorize_page_html(params))
+    # 密码对 -> 给 grant_token, 重定向到 GET /oauth/authorize?grant_token=...
+    grant_token = hermes_oauth.create_grant_token(params)
+    log(f"[oauth] password OK, grant_token={grant_token[:8]}... client={client_id[:8]}...")
+    base_url = str(request.base_url).rstrip("/")
+    redirect = f"{base_url}/oauth/authorize?grant_token={grant_token}"
+    return RedirectResponse(redirect, status_code=302)
 
 
 @app.post("/oauth/token")
@@ -234,7 +346,7 @@ async def oauth_token(request: Request):
     return JSONResponse(content=result)
 
 
-# ── MCP 端点 ───────────────────────────────────────
+# ── MCP 端点 (MCP 2025-06-18 streamable HTTP) ──────
 @app.get("/mcp")
 async def mcp_get():
     return JSONResponse(
@@ -246,18 +358,69 @@ async def mcp_get():
 @app.post("/mcp")
 async def mcp_post(req: JsonRpcRequest, request: Request):
     client = check_auth(request)
-    print(f"[hermes-mcp-remote] {client} -> {req.method} (id={req.id})", file=sys.stderr)
-    resp = await stdio_mcp.call(req.dict(exclude_none=True))
+
+    # MCP-Protocol-Version 头协商 (2025-06-18 spec)
+    client_proto = request.headers.get("mcp-protocol-version")
+    proto_version = client_proto if client_proto in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+
+    # Accept 头 (text/event-stream 允许, 2025-06-18 spec)
+    accept = request.headers.get("accept", "application/json")
+    use_sse = "text/event-stream" in accept
+
+    # notifications/initialized: 202 no body, 不转发 stdio
+    if req.method == "notifications/initialized":
+        sid = request.headers.get("mcp-session-id")
+        if sid and sid in sessions:
+            mark_session_initialized(sid)
+        log(f"[mcp] {client} -> notifications/initialized (sid={sid[:8] if sid else 'new'}...)")
+        return Response(status_code=202)
+
+    # initialize: 生成 session + 立即返回 serverInfo
+    if req.method == "initialize":
+        sid = get_or_create_session(request, client)
+        # 从 stdio 拿 serverInfo, 但覆盖 protocolVersion
+        resp = await stdio_mcp.call(req.dict(exclude_none=True), timeout=15)
+        if isinstance(resp, dict) and "result" in resp:
+            resp["result"]["protocolVersion"] = proto_version
+            resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        log(f"[mcp] {client} -> initialize (proto={proto_version}, sid={sid[:8]}...)")
+        return Response(
+            content=json.dumps(resp),
+            media_type="text/event-stream" if use_sse else "application/json",
+            headers={"Mcp-Session-Id": sid},
+        )
+
+    # 其他 JSON-RPC: 检查 session (initialized 之后才能调业务)
+    sid = request.headers.get("mcp-session-id")
+    if not sid or sid not in sessions:
+        # 2025-06-18 允许 stateless, 但 ChatGPT 通常带 sid
+        pass
+    if sid and sid in sessions and not sessions[sid].get("initialized"):
+        # 已给 sid 但没 initialized, 拒绝业务方法
+        if req.method not in ("ping",):
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": -32600, "message": "session not initialized; call notifications/initialized first"}},
+            )
+
+    log(f"[mcp] {client} -> {req.method} (id={req.id}, sid={sid[:8] if sid else 'none'}...)")
+    resp = await stdio_mcp.call(req.dict(exclude_none=True), timeout=30)
     if isinstance(resp, dict) and "result" in resp:
         resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    return JSONResponse(content=resp)
+
+    return Response(
+        content=json.dumps(resp),
+        media_type="text/event-stream" if use_sse else "application/json",
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    log("[shutdown] bridge stopping...")
     await stdio_mcp.stop()
+    _log_file.close()
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
