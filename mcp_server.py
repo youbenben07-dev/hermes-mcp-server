@@ -257,8 +257,38 @@ def tool_hermes_logs(args: dict) -> dict:
         return {"ok": False, "error": f"unknown target '{target}'. Options: worker, worker_err, nginx_access, nginx_error"}
 
 
+def tool_hermes_health_check(args: dict) -> dict:
+    """Stage 3.7.3: 极简只读健康检查, 用于 ChatGPT action discovery 调试.
+    返回 agent 状态 + mcp server 状态 + 服务版本 + 服务器时间, 绝不暴露凭据."""
+    import time as _time
+    return {
+        "ok": True,
+        "agent": "hermes-dev-agent",
+        "agent_status": "active",
+        "mcp_server_status": "running",
+        "mcp_server_version": "3.7.3",
+        "supported_protocol_versions": [
+            "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28",
+        ],
+        "default_protocol_version": "2026-07-28",
+        "tools_count": 6,
+        "tools": list(TOOLS.keys()),
+        "server_time": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "server_host": "vps-racknerd (23.95.226.156)",
+        "public_url": "https://mcp.hermes.toothingbeginning.com/mcp",
+    }
+
+
 # ── MCP 协议处理 (stdio transport) ──────────────────
 TOOLS = {
+    "hermes_health_check": {
+        "fn": tool_hermes_health_check,
+        "schema": {
+            "name": "hermes_health_check",
+            "description": "Minimal read-only health check. Returns agent status, MCP server version, current server time, and list of all available tools. No credentials, no sensitive config exposed. Use this to verify MCP connectivity.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
     "hermes_system_status": {
         "fn": tool_hermes_system_status,
         "schema": {

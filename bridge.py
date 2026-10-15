@@ -347,11 +347,52 @@ async def oauth_token(request: Request):
 
 # ── MCP 端点 (MCP 2025-06-18 streamable HTTP) ──────
 @app.get("/mcp")
-async def mcp_get():
+async def mcp_get(request: Request):
+    """Stage 3.7.3: ChatGPT connector 期望 MCP 根端点 GET 返回 tool 列表作为 action discovery.
+    用 OAuth Bearer token 认证后返回 tools 列表. 这是 ChatGPT 真正用做 discover 的路径."""
+    client = "anonymous"
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        t = auth[7:].strip()
+        if secrets.compare_digest(t, TOKEN):
+            client = "static"
+        else:
+            valid, _ = hermes_oauth.verify_access_token(t)
+            if valid:
+                client = "oauth"
+    # 用 stdio 拿 tool 列表 (stdio 总是活的)
+    tools_list_req = {
+        "jsonrpc": "2.0", "id": "get-mcp-list", "method": "tools/list"
+    }
+    resp = await stdio_mcp.call(tools_list_req, timeout=10)
+    if isinstance(resp, dict) and "result" in resp:
+        tools = resp["result"].get("tools", [])
+        # 返回 OpenAI 期望的格式: result 字段含 tools
+        log(f"[mcp-discover] {client} GET /mcp -> {len(tools)} tools")
+        return Response(
+            content=json.dumps({"jsonrpc": "2.0", "id": "get-mcp-list", "result": {"tools": tools}}),
+            media_type="application/json",
+            headers={"X-Accel-Buffering": "no"},
+        )
     return JSONResponse(
-        status_code=405,
-        content={"error": "Method Not Allowed. Use POST with JSON-RPC body."},
+        status_code=500,
+        content={"error": "stdio backend not available"},
     )
+
+
+@app.middleware("http")
+async def debug_log_middleware(request: Request, call_next):
+    """Stage 3.7.3: 详细记每个 mcp 请求 (client IP + headers) 用于 ChatGPT 真实诊断."""
+    if request.url.path.startswith("/mcp") or request.url.path.startswith("/oauth"):
+        client_ip = request.client.host if request.client else "?"
+        ua = request.headers.get("user-agent", "?")[:80]
+        mcp_ver = request.headers.get("mcp-protocol-version", "-")
+        mcp_meth = request.headers.get("mcp-method", "-")
+        origin = request.headers.get("origin", "-")
+        auth = request.headers.get("authorization", "-")
+        auth_type = "static" if secrets.compare_digest(auth[7:].strip() if auth.startswith("Bearer ") else "", TOKEN) else ("oauth" if auth.startswith("Bearer ") and hermes_oauth.verify_access_token(auth[7:].strip())[0] else "anon")
+        log(f"[mcp-req] {request.method} {request.url.path} from {client_ip} ua={ua!r} mcp_ver={mcp_ver} mcp_method={mcp_meth} origin={origin} auth={auth_type}")
+    return await call_next(request)
 
 
 def _validate_origin(request: Request) -> bool:
