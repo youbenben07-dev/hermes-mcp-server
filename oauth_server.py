@@ -211,13 +211,12 @@ def authorize_validate(client_id, redirect_uri, code_challenge, code_challenge_m
         return None, "redirect_uri not registered", None
     conn.close()
     requested_scope = scope or SCOPE
-    # Stage 4.5.1 修复: mcp:write 签发与 auto_authorization.enabled 解耦.
-    # 白名单 client (管理员在 authorized_clients 明确列出) 拿完整 scope,
-    # 即使 ChatGPT 只请求 mcp:read 也自动升级为 mcp:read mcp:write.
-    # 非白名单 client 即使请求 mcp:write 也降级为 mcp:read (安全默认).
+    # Stage 4.6: mcp:write 签发只看 client_id 精确白名单 (服务端 DCR 生成的唯一身份).
+    # 不与 enabled 绑死, 不用 redirect_uri 匹配 (可伪造), 不信任客户端自报身份.
+    # 白名单 client 即使只请求 mcp:read 也自动升级为 mcp:read mcp:write.
     try:
         import auto_authorization as _aa
-        if _aa.is_scope_authorized(client_id, redirect_uri):
+        if _aa.is_scope_authorized(client_id):
             requested_scope = "mcp:read mcp:write"
         elif requested_scope == "mcp:write":
             requested_scope = "mcp:read"
@@ -336,6 +335,26 @@ def verify_access_token(token: str):
         return False, None
     conn.close()
     return True, row["scope"]
+
+
+def verify_access_token_ctx(token: str):
+    """返回 (valid, scope, client_id). 扩展版, 含 client_id 供身份映射.
+
+    Stage 4.6: client_id 是 DCR 注册时服务端生成的唯一标识, 是可信身份来源.
+    bridge 用它在 tools/call 时注入 client_identity, 不信任客户端自填的字符串.
+    """
+    if not token:
+        return False, None, None
+    conn = _db()
+    row = conn.execute("SELECT * FROM tokens WHERE access_token=?", (token,)).fetchone()
+    if not row:
+        conn.close()
+        return False, None, None
+    if row["expires_at"] < _now():
+        conn.close()
+        return False, None, None
+    conn.close()
+    return True, row["scope"], row["client_id"]
 
 # ── 授权页 HTML ────────────────────────────────────────
 def _esc(s):

@@ -27,8 +27,6 @@ DEFAULT_POLICY = {
     "enabled": False,
     # MCP 授权用户身份 (OAuth client_id 或 "static-token" 代表 PM 静态 token)
     "authorized_clients": [],
-    # 授权 redirect_uri (ChatGPT connector 固定标识, 每次 DCR client_id 会变)
-    "authorized_redirect_uris": [],
     # 指定客服系统仓库
     "allowed_repos": ["/home/fastmedlink/cs-inbox"],
     # 允许修改的文件类型及目录 (glob)
@@ -109,32 +107,20 @@ def is_client_authorized(client_identity: str) -> bool:
     return client_identity in clients
 
 
-def is_scope_authorized(client_identity: str, redirect_uri: str = "") -> bool:
-    """校验 client 是否在 mcp:write 白名单 (与 enabled 解耦, 只看名单).
+def is_scope_authorized(client_identity: str) -> bool:
+    """校验 client 是否在 mcp:write 白名单 (与 enabled 解耦, 只看 client_id 精确匹配).
 
-    Stage 4.5.1 修复: mcp:write scope 的签发不应被 auto_authorization.enabled 绑死.
-    enabled 控制无人值守 auto-execute, 而 mcp:write 只应看管理员是否把该 client 列入白名单.
-    这样管理员可以在 enabled=false 时先给 ChatGPT 签发 mcp:write 授权,
-    再单独启 flag 才真正写 ECS (分层控制).
-
-    匹配规则 (OR):
-    - client_id 精确命中 authorized_clients
-    - redirect_uri 命中 authorized_redirect_uris (ChatGPT 每次 DCR 会换 client_id,
-      但 redirect_uri 是 connector 固定标识; 安全由 OAuth 密码门禁保证)
+    Stage 4.6: 身份来源 = 服务端 DCR 生成的 client_id (唯一, 不可伪造).
+    - 禁止 redirect_uri 匹配 (redirect_uri 可被任何 DCR client 自报, 不安全)
+    - 禁止 "*" 通配 (不开放给全部客户端)
     """
     p = load_policy()
     clients = p.get("authorized_clients", [])
-    redirects = p.get("authorized_redirect_uris", [])
-    if not clients and not redirects:
+    if not clients:
         return False
-    # "*" 不代表具体白名单身份 — 不开放给全部客户端
-    if clients and "*" in clients:
+    if "*" in clients:
         return False
-    if clients and client_identity in clients:
-        return True
-    if redirects and redirect_uri in redirects:
-        return True
-    return False
+    return client_identity in clients
 
 
 def check_forbidden(operation: str, file_paths: list, patch_text: str = "") -> tuple[bool, str]:

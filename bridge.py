@@ -229,6 +229,27 @@ def _has_write_scope(request: Request) -> bool:
     return valid and bool(scope) and "mcp:write" in scope.split()
 
 
+def get_verified_client_id(request: Request) -> str:
+    """从已认证请求提取可信 client 身份 (Stage 4.6).
+
+    静态 PM token → "static-token"; OAuth access token → 其 DCR client_id.
+    这是服务端验证后注入 tool 调用的唯一身份来源, 绝不信任客户端自填的
+    client_id/client_name/chatgpt 字符串.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return ""
+    tok = auth[7:].strip()
+    if secrets.compare_digest(tok, TOKEN):
+        return "static-token"
+    valid, _scope, client_id = hermes_oauth.verify_access_token_ctx(tok)
+    return client_id if valid else ""
+
+
+# 需要服务端注入 client_identity 的工具 (不信任客户端传值)
+CLIENT_IDENTITY_TOOLS = {"hermes_auto_execute"}
+
+
 # ── 根端点 ─────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -524,6 +545,14 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
                 status_code=403,
                 content={"jsonrpc": "2.0", "id": req.id, "error": {"code": -32000, "message": "mcp:write scope required for this tool"}},
             )
+        # Stage 4.6: 注入服务端验证的 client_id (覆盖客户端自填的 client_identity/chatgpt 字符串)
+        if _tool_name in CLIENT_IDENTITY_TOOLS:
+            _verified_cid = get_verified_client_id(request)
+            _args = dict((req.params or {}).get("arguments") or {})
+            _args["client_identity"] = _verified_cid
+            req.params = dict(req.params or {})
+            req.params["arguments"] = _args
+            log(f"[mcp] inject client_identity={_verified_cid[:8]}... for {_tool_name}")
 
     # MCP-Protocol-Version 头协商 (2026-07-28 强制)
     client_proto = request.headers.get("mcp-protocol-version")
