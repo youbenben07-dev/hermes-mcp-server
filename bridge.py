@@ -224,7 +224,9 @@ def _has_write_scope(request: Request) -> bool:
     if secrets.compare_digest(tok, TOKEN):
         return True  # PM 静态 token
     valid, scope = hermes_oauth.verify_access_token(tok)
-    return valid and scope == "mcp:write"
+    # Stage 4.5.1: scope 可能为多值 "mcp:read mcp:write" (空格分隔),
+    # 不能精确 == "mcp:write". 检查是否包含 mcp:write 即视为有写权限.
+    return valid and bool(scope) and "mcp:write" in scope.split()
 
 
 # ── 根端点 ─────────────────────────────────────────

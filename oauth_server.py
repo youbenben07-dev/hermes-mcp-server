@@ -211,16 +211,19 @@ def authorize_validate(client_id, redirect_uri, code_challenge, code_challenge_m
         return None, "redirect_uri not registered", None
     conn.close()
     requested_scope = scope or SCOPE
-    # Stage 4.5 安全: mcp:write 必须白名单授权 (防任意 OAuth client 请求写权限)
-    # 只有 auto_authorization.json 的 authorized_clients 明确列出该 client 才签发 mcp:write,
-    # 否则降级为 mcp:read (安全默认: 未启用/未授权的 client 一律只读).
-    if requested_scope == "mcp:write":
-        try:
-            import auto_authorization as _aa
-            if not _aa.is_client_authorized(client_id):
-                requested_scope = "mcp:read"
-        except Exception:
+    # Stage 4.5.1 修复: mcp:write 签发与 auto_authorization.enabled 解耦.
+    # 白名单 client (管理员在 authorized_clients 明确列出) 拿完整 scope,
+    # 即使 ChatGPT 只请求 mcp:read 也自动升级为 mcp:read mcp:write.
+    # 非白名单 client 即使请求 mcp:write 也降级为 mcp:read (安全默认).
+    try:
+        import auto_authorization as _aa
+        if _aa.is_scope_authorized(client_id, redirect_uri):
+            requested_scope = "mcp:read mcp:write"
+        elif requested_scope == "mcp:write":
             requested_scope = "mcp:read"
+    except Exception:
+        # 任何异常 → 安全默认只读
+        requested_scope = "mcp:read"
     return {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
