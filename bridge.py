@@ -345,38 +345,15 @@ async def oauth_token(request: Request):
     return JSONResponse(content=result)
 
 
-# ── MCP 端点 (MCP 2025-06-18 streamable HTTP) ──────
+# ── MCP 端点 (MCP 2026-07-28 streamable HTTP) ──────
 @app.get("/mcp")
 async def mcp_get(request: Request):
-    """Stage 3.7.3: ChatGPT connector 期望 MCP 根端点 GET 返回 tool 列表作为 action discovery.
-    用 OAuth Bearer token 认证后返回 tools 列表. 这是 ChatGPT 真正用做 discover 的路径."""
-    client = "anonymous"
-    auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer "):
-        t = auth[7:].strip()
-        if secrets.compare_digest(t, TOKEN):
-            client = "static"
-        else:
-            valid, _ = hermes_oauth.verify_access_token(t)
-            if valid:
-                client = "oauth"
-    # 用 stdio 拿 tool 列表 (stdio 总是活的)
-    tools_list_req = {
-        "jsonrpc": "2.0", "id": "get-mcp-list", "method": "tools/list"
-    }
-    resp = await stdio_mcp.call(tools_list_req, timeout=10)
-    if isinstance(resp, dict) and "result" in resp:
-        tools = resp["result"].get("tools", [])
-        # 返回 OpenAI 期望的格式: result 字段含 tools
-        log(f"[mcp-discover] {client} GET /mcp -> {len(tools)} tools")
-        return Response(
-            content=json.dumps({"jsonrpc": "2.0", "id": "get-mcp-list", "result": {"tools": tools}}),
-            media_type="application/json",
-            headers={"X-Accel-Buffering": "no"},
-        )
+    """Stage 3.8: MCP Streamable HTTP 规范只接受 POST (GET stream endpoint 已在
+    2026-07-28 移除). 返回 405 Method Not Allowed 是合规行为.
+    之前 Stage 3.7.3 返回非标准 tools 列表, 已移除."""
     return JSONResponse(
-        status_code=500,
-        content={"error": "stdio backend not available"},
+        status_code=405,
+        content={"error": "Method Not Allowed. MCP Streamable HTTP accepts POST only."},
     )
 
 
@@ -431,19 +408,20 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
             "_meta": {
                 "io.modelcontextprotocol/serverInfo": {
                     "name": "hermes-dev-agent",
-                    "version": "3.7.2",
+                    "version": "3.8.0",
                 }
             },
-            "instructions": "Hermes Dev Agent 提供 5 个只读 MCP 工具: hermes_system_status, hermes_ecs_shell, hermes_read_file, hermes_git_status, hermes_logs. 所有工具只读, 无副作用. 通过 OAuth 2.1 access_token (scope mcp:read) 认证.",
+            "instructions": "Hermes Dev Agent 提供 6 个只读 MCP 工具: hermes_health_check, hermes_system_status, hermes_ecs_shell, hermes_read_file, hermes_git_status, hermes_logs. 所有工具只读, 无副作用. 通过 OAuth 2.1 access_token (scope mcp:read) 认证.",
             "ttlMs": 3600000,
             "cacheScope": "public",
         }
+        # 注意: 不附加 _audit 字段 —— ChatGPT 会对比多次 discover 响应,
+        # non-deterministic 字段(如时间戳)会导致 "discover response was inconsistent".
         resp = {"jsonrpc": "2.0", "id": req.id, "result": result}
-        resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         log(f"[mcp] {client} -> server/discover")
         return Response(
             content=json.dumps(resp),
-            media_type="text/event-stream" if use_sse_discover else "application/json",
+            media_type="application/json",
             headers={"X-Accel-Buffering": "no"},
         )
 
@@ -483,11 +461,11 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
             resp["result"]["protocolVersion"] = proto_version
             # 确保 serverInfo 完整
             if "serverInfo" not in resp["result"]:
-                resp["result"]["serverInfo"] = {"name": "hermes-dev-agent", "version": "3.7.2"}
-            resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                resp["result"]["serverInfo"] = {"name": "hermes-dev-agent", "version": "3.8.0"}
+        # 不附加 _audit (避免 non-deterministic 响应)
         return Response(
             content=json.dumps(resp),
-            media_type="text/event-stream" if use_sse else "application/json",
+            media_type="application/json",
             headers={"X-Accel-Buffering": "no"},
         )
 
@@ -499,12 +477,23 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
     #         return JSONResponse(...)
 
     resp = await stdio_mcp.call(req.dict(exclude_none=True), timeout=30)
-    if isinstance(resp, dict) and "result" in resp:
-        resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    # Stage 3.8: 2025-11-25 / 2026-07-28 规范要求结果含 resultType/ttlMs/cacheScope.
+    # ChatGPT 用 2026-07-28, 这三个字段是 REQUIRED (否则 SDK 报 Field required).
+    # 旧协议 (2024-11-05/2025-03-26/2025-06-18) 的 tools/list 不需要, 故按版本 gate.
+    modern = proto_version in ("2025-11-25", "2026-07-28")
+    if isinstance(resp, dict) and "result" in resp and isinstance(resp["result"], dict):
+        r = resp["result"]
+        if req.method == "tools/list" and modern:
+            r.setdefault("resultType", "complete")
+            r.setdefault("ttlMs", 3600000)
+            r.setdefault("cacheScope", "public")
+        elif req.method == "tools/call" and modern:
+            r.setdefault("resultType", "complete")
 
     return Response(
         content=json.dumps(resp),
-        media_type="text/event-stream" if use_sse else "application/json",
+        media_type="application/json",
         headers={"X-Accel-Buffering": "no"},
     )
 

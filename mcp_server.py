@@ -266,7 +266,7 @@ def tool_hermes_health_check(args: dict) -> dict:
         "agent": "hermes-dev-agent",
         "agent_status": "active",
         "mcp_server_status": "running",
-        "mcp_server_version": "3.7.3",
+        "mcp_server_version": "3.8.0",
         "supported_protocol_versions": [
             "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28",
         ],
