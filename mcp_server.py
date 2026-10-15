@@ -353,6 +353,16 @@ TOOLS = {
 }
 
 
+# Stage 4: 注册 7 个受控工具 (change_plan/create_backup/apply_patch/run_tests/deploy/rollback/change_status)
+try:
+    import hermes_stage4
+    hermes_stage4.init_state_db()
+    hermes_stage4.register_tools(TOOLS)
+except Exception as _e:
+    import sys as _sys
+    _sys.stderr.write(f"[stage4] register failed: {_e}\n")
+
+
 def send(msg: dict):
     """发 MCP 消息 (JSON-RPC over stdio, newline delimited)."""
     line = json.dumps(msg)

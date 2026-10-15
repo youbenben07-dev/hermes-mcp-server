@@ -36,7 +36,8 @@ from pathlib import Path
 
 BASE_URL = "https://mcp.hermes.toothingbeginning.com"
 DB_PATH = Path("/home/hermes/mcp_servers/oauth.db")
-SCOPE = "mcp:read"
+SCOPE = "mcp:read"          # 默认签发 scope (只读)
+SCOPES_SUPPORTED = ["mcp:read", "mcp:write"]  # 支持的 scope (write 用于 Stage 4 写工具)
 ACCESS_TOKEN_TTL = 86400       # 24h
 REFRESH_TOKEN_TTL = 2592000    # 30 天
 AUTH_CODE_TTL = 300             # 5 分钟
@@ -165,7 +166,7 @@ def get_metadata():
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": [SCOPE],
+        "scopes_supported": SCOPES_SUPPORTED,
     }
 
 # ── DCR 客户端注册 ─────────────────────────────────────

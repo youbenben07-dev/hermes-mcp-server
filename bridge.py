@@ -53,7 +53,20 @@ from pydantic import BaseModel
 # ── 配置 ────────────────────────────────────────────
 DEFAULT_TOKEN_FILE = "/home/hermes/.hermes/mcp_remote_token"
 TOKEN = os.environ.get("HERMES_MCP_TOKEN")
-OAUTH_PASSWORD = os.environ.get("HERMES_OAUTH_PASSWORD", "hermes-oauth-2026")  # 默认密码 (可改 env)
+OAUTH_PASSWORD_FILE = "/home/hermes/.hermes/mcp_oauth_password"  # 授权页密码 (mode 600, 不入 git)
+
+
+def _load_oauth_password() -> str:
+    """授权页密码从文件读 (不入公开仓库), 其次 env, 无默认硬编码."""
+    try:
+        if os.path.exists(OAUTH_PASSWORD_FILE):
+            return open(OAUTH_PASSWORD_FILE).read().strip()
+    except Exception:
+        pass
+    return os.environ.get("HERMES_OAUTH_PASSWORD", "")
+
+
+OAUTH_PASSWORD = _load_oauth_password()
 HOST = os.environ.get("HERMES_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HERMES_MCP_PORT", "8443"))
 STDIO_CMD = os.environ.get("HERMES_STDIO_CMD", "/home/hermes/.hermes/hermes-agent/venv/bin/python3")
@@ -195,6 +208,25 @@ def check_auth(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Invalid bearer token", headers=ww)
 
 
+# ── Stage 4 写工具 scope 门禁 ───────────────────────
+WRITE_TOOLS = {
+    "hermes_create_backup", "hermes_apply_patch", "hermes_run_tests",
+    "hermes_deploy", "hermes_rollback",
+}
+
+
+def _has_write_scope(request: Request) -> bool:
+    """写工具需要 mcp:write scope. 静态 PM token 隐式全权."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    tok = auth[7:].strip()
+    if secrets.compare_digest(tok, TOKEN):
+        return True  # PM 静态 token
+    valid, scope = hermes_oauth.verify_access_token(tok)
+    return valid and scope == "mcp:write"
+
+
 # ── 根端点 ─────────────────────────────────────────
 @app.get("/")
 async def root():
@@ -226,7 +258,7 @@ async def oauth_resource_metadata():
     return JSONResponse(content={
         "resource": f"{hermes_oauth.BASE_URL}/mcp",
         "authorization_servers": [hermes_oauth.BASE_URL],
-        "scopes_supported": [hermes_oauth.SCOPE],
+        "scopes_supported": hermes_oauth.SCOPES_SUPPORTED,
     })
 
 
@@ -427,6 +459,16 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
 
     # 认证 (其他方法必须 auth)
     client = check_auth(request)
+
+    # Stage 4: 写工具 scope 门禁 (mcp:write)
+    if req.method == "tools/call":
+        _tool_name = ((req.params or {}).get("name", "") or "")
+        if _tool_name in WRITE_TOOLS and not _has_write_scope(request):
+            log(f"[mcp] WRITE DENIED (scope): {_tool_name} client={client}")
+            return JSONResponse(
+                status_code=403,
+                content={"jsonrpc": "2.0", "id": req.id, "error": {"code": -32000, "message": "mcp:write scope required for this tool"}},
+            )
 
     # MCP-Protocol-Version 头协商 (2026-07-28 强制)
     client_proto = request.headers.get("mcp-protocol-version")
