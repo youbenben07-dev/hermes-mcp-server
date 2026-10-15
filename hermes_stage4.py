@@ -889,20 +889,41 @@ def _do_deploy_mock_ecs(task_id: str, commit: str, health_url: str) -> dict:
 
 
 def _ssh_deploy_ecs(task_id: str, commit: str, health_url: str) -> dict:
-    """真实 ECS 部署 (SSH 固定命令模板). 需要 PRODUCTION_WRITE_ENABLED=True + 2 步确认."""
-    confirm_file = MOCK_ECS_BASE / f".confirm_ecs_{task_id}"
-    if not confirm_file.exists():
-        return {"ok": False, "denied": True,
-                "reason": "ECS production deploy requires 2-step confirmation",
-                "required_action": f"echo CONFIRM > {confirm_file}"}
-    confirm_file.unlink(missing_ok=True)
+    """真实 ECS 部署 (SSH 固定命令模板). 需要 PRODUCTION_WRITE_ENABLED=True.
+
+    Stage 4.4 已取消逐次人工审批 + .confirm_ecs 确认文件, 门禁改由
+    auto_authorization 策略 (enabled + client 白名单 + target/文件禁区) 在
+    tool_auto_execute 入口统一校验. 本函数只保留 flag + 票据已由 tool_deploy 校验.
+    """
     r = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "HEAD"], timeout=15)
     if not r["ok"]:
         return {"ok": False, "reason": f"read prev_head failed: {r['stderr'][:200]}"}
     prev_head = r["stdout"].strip()[:7]
+    safe_task = "".join(c for c in task_id if c.isalnum() or c in "_-") or "task"
     rc = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--verify", commit], timeout=10)
     if not rc["ok"]:
-        return {"ok": False, "denied": True, "reason": f"commit {commit} not in ECS repo"}
+        # commit 不在 ECS (patch 在 VPS LOCAL_TEST_REPO 生成) → git bundle 传输
+        bundle_local = LOCAL_BACKUP_ROOT / safe_task / "incoming.bundle"
+        bundle_local.parent.mkdir(parents=True, exist_ok=True)
+        b = subprocess.run(["git", "-C", str(LOCAL_TEST_REPO), "bundle", "create",
+                            str(bundle_local), commit],
+                           capture_output=True, text=True, timeout=60)
+        if b.returncode != 0:
+            return {"ok": False, "denied": True,
+                    "reason": f"local bundle create failed: {b.stderr[:200]}"}
+        scp_b = subprocess.run(["scp", "-o", "ConnectTimeout=8", str(bundle_local),
+                                f"{ECS_HOST}:/tmp/{safe_task}_incoming.bundle"],
+                               capture_output=True, text=True, timeout=60)
+        if scp_b.returncode != 0:
+            return {"ok": False, "reason": f"scp incoming bundle failed: {scp_b.stderr[:200]}"}
+        rf = _ssh_exec(["git", "-C", ECS_CS_INBOX, "fetch",
+                        f"/tmp/{safe_task}_incoming.bundle"], timeout=60)
+        if not rf["ok"]:
+            return {"ok": False, "reason": f"ECS fetch incoming bundle failed: {rf['stderr'][:200]}"}
+        rc = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--verify", commit], timeout=10)
+        if not rc["ok"]:
+            return {"ok": False, "denied": True,
+                    "reason": f"commit {commit} still not in ECS after bundle transfer"}
     target_sha = rc["stdout"].strip()
     ts = time.strftime("%Y%m%d-%H%M%S")
     bk_local = LOCAL_BACKUP_ROOT / task_id / f"ecs_pre_deploy_{ts}"
@@ -915,12 +936,17 @@ def _ssh_deploy_ecs(task_id: str, commit: str, health_url: str) -> dict:
                           str(bk_local / "pre.bundle")], capture_output=True, text=True, timeout=60)
     if scp.returncode != 0:
         return {"ok": False, "reason": f"scp bundle failed: {scp.stderr[:200]}"}
-    sqlite_bk_cmd = 'sqlite3 ' + ECS_DB + ' ".backup /tmp/' + task_id + '_inbox.db"'
+    # SQLite 在线备份 (ECS 无 sqlite3 CLI, 用 python3 sqlite3 模块 .backup)
+    # safe_task 已在函数开头 sanitize 定义
+    sqlite_bk_cmd = (
+        "python3 -c \"import sqlite3; "
+        f"sqlite3.connect('{ECS_DB}').backup(sqlite3.connect('/tmp/{safe_task}_inbox.db'))\""
+    )
     rb2 = _ssh_exec(["bash", "-lc", sqlite_bk_cmd], timeout=60)
     if not rb2["ok"]:
         return {"ok": False, "reason": f"ECS sqlite .backup failed: {rb2['stderr'][:200]}"}
     db_bk_local = bk_local / "inbox.db"
-    scp2 = subprocess.run(["scp", "-o", "ConnectTimeout=8", f"{ECS_HOST}:/tmp/{task_id}_inbox.db",
+    scp2 = subprocess.run(["scp", "-o", "ConnectTimeout=8", f"{ECS_HOST}:/tmp/{safe_task}_inbox.db",
                            str(db_bk_local)], capture_output=True, text=True, timeout=60)
     if scp2.returncode != 0:
         return {"ok": False, "reason": f"scp db failed: {scp2.returncode}"}
@@ -928,27 +954,33 @@ def _ssh_deploy_ecs(task_id: str, commit: str, health_url: str) -> dict:
     if not rr["ok"]:
         return {"ok": False, "reason": f"git reset failed: {rr['stderr'][:200]}"}
     new_head = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
-    rs = _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+    rs = _ssh_exec(["sudo", "-n", "systemctl", "restart", ECS_SERVICE], timeout=30)
     if not rs["ok"]:
         _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", prev_head], timeout=30)
-        _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+        _ssh_exec(["sudo", "-n", "systemctl", "restart", ECS_SERVICE], timeout=30)
         return {"ok": False, "reason": f"systemctl restart failed (auto-rolled back): {rs['stderr'][:200]}"}
-    health_url_final = health_url or f"http://127.0.0.1:{ECS_SERVICE_PORT}/health"
+    # health check: 必须通过 SSH 在 ECS 上查 (127.0.0.1:5051 在 ECS, 不是 VPS localhost)
     health_ok = False
     health = ""
     for _ in range(6):
         time.sleep(5)
-        h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                            health_url_final, "--max-time", "3"],
-                           capture_output=True, text=True, timeout=5)
-        code = h.stdout.strip()
+        if health_url:
+            h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                                health_url, "--max-time", "3"],
+                               capture_output=True, text=True, timeout=5)
+            code = h.stdout.strip()
+        else:
+            hh = _ssh_exec(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                            f"http://127.0.0.1:{ECS_SERVICE_PORT}/health", "--max-time", "3"],
+                           timeout=10)
+            code = hh["stdout"].strip() if hh["ok"] else ""
         health = f"HTTP {code}"
         if code.startswith("2"):
             health_ok = True
             break
     if not health_ok:
         _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", prev_head], timeout=30)
-        _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+        _ssh_exec(["sudo", "-n", "systemctl", "restart", ECS_SERVICE], timeout=30)
         return {"ok": False, "reason": f"health check failed (auto-rolled back to {prev_head}): {health}"}
     _set_task_status(task_id, "deployed", commit_sha=new_head, report_path=str(bk_local))
     _audit(task_id, "deploy", "ok", f"target=ecs commit={new_head} health={health}")
@@ -1112,13 +1144,10 @@ def _do_rollback_mock_ecs(task_id: str, target: str) -> dict:
 
 
 def _ssh_rollback_ecs(task_id: str, inner_target: str) -> dict:
-    """真实 ECS 远程回滚 (SSH 固定命令). 需要 2 步确认."""
-    confirm_file = MOCK_ECS_BASE / f".confirm_ecs_rb_{task_id}"
-    if not confirm_file.exists():
-        return {"ok": False, "denied": True,
-                "reason": "ECS rollback requires 2-step confirmation",
-                "required_action": f"echo CONFIRM > {confirm_file}"}
-    confirm_file.unlink(missing_ok=True)
+    """真实 ECS 远程回滚 (SSH 固定命令). 需要 PRODUCTION_WRITE_ENABLED=True.
+
+    Stage 4.4 已取消 confirm_file 2-step, 门禁由 auto_authorization 策略统一校验.
+    """
     r = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "HEAD"], timeout=10)
     prev_head = r["stdout"].strip()[:7]
     if inner_target.startswith("commit:"):
@@ -1129,16 +1158,20 @@ def _ssh_rollback_ecs(task_id: str, inner_target: str) -> dict:
         rr = _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", target_sha], timeout=30)
         if not rr["ok"]:
             return {"ok": False, "reason": f"reset failed: {rr['stderr'][:200]}"}
+    elif inner_target == "prev":
+        # 回滚到上一个 HEAD (部署前的 commit), 用 reflog
+        rr = _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", "HEAD@{1}"], timeout=30)
+        if not rr["ok"]:
+            return {"ok": False, "reason": f"reset to prev failed: {rr['stderr'][:200]}"}
     else:
         return {"ok": False, "reason": f"unsupported ecs rollback target: {inner_target}"}
-    rs = _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+    rs = _ssh_exec(["sudo", "-n", "systemctl", "restart", ECS_SERVICE], timeout=30)
     if not rs["ok"]:
         return {"ok": False, "reason": f"restart failed: {rs['stderr'][:200]}"}
     time.sleep(5)
-    h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                        f"http://127.0.0.1:{ECS_SERVICE_PORT}/health", "--max-time", "3"],
-                       capture_output=True, text=True, timeout=5)
-    health = h.stdout.strip()
+    hh = _ssh_exec(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                    f"http://127.0.0.1:{ECS_SERVICE_PORT}/health", "--max-time", "3"], timeout=10)
+    health = hh["stdout"].strip() if hh["ok"] else ""
     new_head = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
     _audit(task_id, "rollback", "ok", f"target=ecs:{inner_target} new_head={new_head} health={health}")
     _set_task_status(task_id, "rolled_back", commit_sha=new_head)
@@ -1317,7 +1350,16 @@ def tool_auto_execute(task_id: str, requirement: str, target_file: str, patch: s
 
     # 3. apply_patch (真实, 到目标 repo 隔离 worktree)
     repo = MOCK_ECS_REPO if target == "mock_ecs" else LOCAL_TEST_REPO
-    patch_r = _apply_patch_to_repo(task_id, target_file, patch, base_commit, "", repo, user="auto")
+    # target=ecs: 先同步 LOCAL_TEST_REPO 到 ECS 当前 HEAD, 保证 patch base 正确
+    # (否则 cs-inbox-fresh 落后 ECS 会分叉, patch 基于旧 HEAD 会丢 ECS 后续提交)
+    patch_base = base_commit
+    if target == "ecs" and repo == LOCAL_TEST_REPO:
+        subprocess.run(["git", "-C", str(LOCAL_TEST_REPO), "fetch", "origin"],
+                       capture_output=True, text=True, timeout=40)
+        subprocess.run(["git", "-C", str(LOCAL_TEST_REPO), "checkout", "-f", git_head],
+                       capture_output=True, text=True, timeout=30)
+        patch_base = git_head
+    patch_r = _apply_patch_to_repo(task_id, target_file, patch, patch_base, "", repo, user="auto")
     if not patch_r.get("ok"):
         _audit(task_id, "auto_execute", "patch_failed", patch_r.get("reason", ""))
         return {"ok": False, "stage": "patch", "reason": patch_r.get("reason"), "detail": patch_r}
