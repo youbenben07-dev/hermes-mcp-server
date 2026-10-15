@@ -211,7 +211,7 @@ def check_auth(request: Request) -> str:
 # ── Stage 4 写工具 scope 门禁 ───────────────────────
 WRITE_TOOLS = {
     "hermes_create_backup", "hermes_apply_patch", "hermes_run_tests",
-    "hermes_deploy", "hermes_rollback",
+    "hermes_deploy", "hermes_rollback", "hermes_auto_execute",
 }
 
 
