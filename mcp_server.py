@@ -404,7 +404,7 @@ def handle_request(req: dict) -> dict:
         }
     elif method == "tools/call":
         name = params.get("name", "")
-        args = params.get("arguments", {})
+        args = params.get("arguments", {}) or {}
         if name not in TOOLS:
             return {
                 "jsonrpc": "2.0", "id": rid,
@@ -418,6 +418,12 @@ def handle_request(req: dict) -> dict:
                     "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}],
                     "isError": not result.get("ok", True),
                 },
+            }
+        except TypeError as e:
+            # 参数缺失/类型错 -> 友好错误 (Stage 4 工具走 fn(**args) 可能漏必填)
+            return {
+                "jsonrpc": "2.0", "id": rid,
+                "error": {"code": -32602, "message": f"Invalid params: {e}. Tool '{name}' requires: see inputSchema."},
             }
         except Exception as e:
             return {

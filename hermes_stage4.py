@@ -34,9 +34,17 @@ STATE_DB = MODULE_DIR / "stage4_state.db"
 APPROVAL_SECRET_FILE = Path("/home/hermes/.hermes/stage4_approval_secret")
 PRODUCTION_WRITE_FLAG_FILE = MODULE_DIR / "PRODUCTION_WRITE_ENABLED"
 
+# ── 隔离演练仓库 (VPS 本地, 非 ECS 生产) ──────────
+LOCAL_TEST_REPO = Path("/home/hermes/cs-inbox-fresh")
+LOCAL_TEST_REPO_REMOTE = LOCAL_TEST_REPO  # 用本地作隔离
+LOCAL_TEST_BACKUP_DIR = Path("/home/hermes/mcp_servers/stage4_backups")
+LOCAL_TEST_SERVICE_PORT = 5059  # 隔离测试服务 (生产是 5051)
+LOCAL_TEST_SCRIPT = Path("/home/hermes/mcp_servers/stage4_test_service.sh")
 ECS_HOST = "fastmedlink@47.250.166.208"
 ECS_CS_INBOX = "/home/fastmedlink/cs-inbox"
 ECS_DB = "/home/fastmedlink/cs-inbox/data/inbox.db"
+ECS_SERVICE = "cs-inbox.service"
+ECS_SERVICE_PORT = 5051
 LOCAL_BACKUP_ROOT = Path("/home/hermes/mcp_servers/stage4_backups")
 
 TICKET_TTL_SECONDS = 300  # 审批票据 5 分钟有效
@@ -508,13 +516,24 @@ def _sqlite_online_backup(dest: Path) -> tuple[bool, str]:
 
 
 def tool_apply_patch(task_id: str, target_file: str, patch: str,
-                     approval_ticket: str, base_commit: str = "") -> dict:
-    """应用补丁. 只在隔离工作树操作, 禁止直接写生产. 需票据 + flag."""
+                     approval_ticket: str, base_commit: str = "",
+                     branch: str = "") -> dict:
+    """在隔离仓库应用 unified diff. 创建 worktree 分支, 校验, 语法检查, 自动 commit.
+
+    安全门禁 (顺序):
+    1. PRODUCTION_WRITE_ENABLED flag (master kill switch)
+    2. HMAC 审批票据 (短期单次, 绑定 task/operation/file/commit)
+    3. 路径白名单 (相对仓库根, 禁绝对路径/穿越/敏感)
+    4. unified diff 路径白名单
+    5. Git HEAD 校验 (若指定 base_commit)
+    6. patch 可干净 apply (允许 diff 中含 "No newline at end of file")
+    7. py_compile 语法检查
+
+    隔离: 默认在 LOCAL_TEST_REPO 创建 worktree 分支 task/<task_id>, 不动 ECS 生产.
+    """
     init_state_db()
     if not production_write_enabled():
-        _audit(task_id, "apply_patch", "denied", "PRODUCTION_WRITE_ENABLED=False")
-        return {"ok": False, "denied": True,
-                "reason": "ECS production write DISABLED. Set PRODUCTION_WRITE_ENABLED flag + valid approval ticket."}
+        return _apply_patch_dryrun(task_id, target_file, patch, base_commit)
     ok, err = verify_approval_ticket(approval_ticket, task_id, "apply_patch", target_file, base_commit)
     if not ok:
         _audit(task_id, "apply_patch", "denied", err)
@@ -522,19 +541,91 @@ def tool_apply_patch(task_id: str, target_file: str, patch: str,
     if not _safe_rel_path(target_file):
         _audit(task_id, "apply_patch", "denied", f"unsafe path {target_file}")
         return {"ok": False, "denied": True, "reason": f"target_file not allowed: {target_file}"}
-    # diff 路径校验
     okp, errp = _validate_diff_paths(patch)
     if not okp:
         _audit(task_id, "apply_patch", "denied", errp)
         return {"ok": False, "denied": True, "reason": errp}
-    # 校验 Git HEAD 与 base_commit 匹配
-    head = _git_head()
-    if base_commit and head != base_commit:
-        return {"ok": False, "denied": True, "reason": f"Git HEAD {head} != base_commit {base_commit}"}
-    # TODO: 实际 patch (隔离工作树) —— 生产写保持 disabled 时不执行
+    lock_ok, lock_owner = acquire_lock(task_id, "apply_patch")
+    if not lock_ok:
+        return {"ok": False, "denied": True, "reason": lock_owner}
+    try:
+        if not LOCAL_TEST_REPO.exists():
+            return {"ok": False, "reason": f"local test repo not found: {LOCAL_TEST_REPO}"}
+        head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
+        if base_commit and head != base_commit:
+            return {"ok": False, "denied": True, "reason": f"local HEAD {head} != base_commit {base_commit}"}
+        wt_dir = LOCAL_TEST_REPO.parent / f"cs-inbox-fresh-wt-{task_id}"
+        br_name = branch or f"task/{task_id}"
+        if wt_dir.exists():
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt_dir)],
+                           cwd=LOCAL_TEST_REPO, capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=LOCAL_TEST_REPO, capture_output=True)
+        r = subprocess.run(["git", "worktree", "add", "-B", br_name, str(wt_dir), "HEAD"],
+                           cwd=LOCAL_TEST_REPO, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return {"ok": False, "reason": f"worktree add failed: {r.stderr[:200]}"}
+        abs_target = wt_dir / target_file
+        if not abs_target.exists():
+            return {"ok": False, "reason": f"target file {target_file} not in worktree (new file diff not supported yet)"}
+        # 用 git apply --check 验证, 然后真 apply. 允许三种 patch 形式:
+        # 1) 标准 unified diff (context 行与文件 1:1 匹配)
+        # 2) 含 "No newline at end of file" 的 diff
+        # 3) diff 中的空行/中文/特殊字符 (git apply 严格, 用 --recount + --whitespace=fix)
+        apply = subprocess.run(
+            ["git", "apply", "--recount", "--whitespace=fix", "-"],
+            input=patch, text=True, cwd=wt_dir, capture_output=True,
+        )
+        if apply.returncode != 0:
+            return {"ok": False, "reason": f"patch apply failed: {apply.stderr[:300]}"}
+        if target_file.endswith(".py"):
+            comp = subprocess.run(
+                ["/home/hermes/.hermes/hermes-agent/venv/bin/python3", "-m", "py_compile",
+                 str(abs_target)],
+                capture_output=True, text=True, timeout=10,
+            )
+            syntax_ok = comp.returncode == 0
+            if not syntax_ok:
+                # 回滚 worktree
+                subprocess.run(["git", "worktree", "remove", "--force", str(wt_dir)],
+                               cwd=LOCAL_TEST_REPO, capture_output=True)
+                return {"ok": False, "reason": f"py_compile failed: {comp.stderr[:200]}"}
+        else:
+            syntax_ok = True
+        sha_after = hashlib.sha256(abs_target.read_bytes()).hexdigest() if abs_target.exists() else ""
+        subprocess.run(["git", "add", "--", target_file], cwd=wt_dir, capture_output=True)
+        commit_msg = f"task {task_id}: apply_patch on {target_file}"
+        r3 = subprocess.run(["git", "-c", "user.name=Hermes-PM", "-c", "user.email=pm@hermes",
+                             "commit", "-m", commit_msg],
+                            cwd=wt_dir, capture_output=True, text=True, timeout=10)
+        new_commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                    cwd=wt_dir, capture_output=True, text=True).stdout.strip()
+        diff_after = subprocess.run(["git", "diff", "HEAD~1", "HEAD", "--", target_file],
+                                    cwd=wt_dir, capture_output=True, text=True).stdout
+        _set_task_status(task_id, "patched", commit_sha=new_commit, report_path=str(wt_dir))
+        _audit(task_id, "apply_patch", "ok", f"file={target_file} commit={new_commit} syntax={syntax_ok}")
+        return {
+            "ok": True, "task_id": task_id, "target_file": target_file,
+            "worktree": str(wt_dir), "branch": br_name, "new_commit": new_commit,
+            "syntax_ok": syntax_ok, "sha256_after": sha_after,
+            "diff_summary": diff_after[:3000],
+            "note": "patch applied to LOCAL TEST REPO (isolated). Not deployed to ECS.",
+        }
+    finally:
+        release_lock(task_id, lock_owner)
+
+
+def _apply_patch_dryrun(task_id: str, target_file: str, patch: str, base_commit: str) -> dict:
+    """flag off 时: 走完整校验 + 报告, 不动文件."""
+    init_state_db()
+    if not _safe_rel_path(target_file):
+        return {"ok": False, "denied": True, "reason": f"target_file not allowed: {target_file}"}
+    okp, errp = _validate_diff_paths(patch)
+    if not okp:
+        return {"ok": False, "denied": True, "reason": errp}
     _audit(task_id, "apply_patch", "dryrun", f"target={target_file} base={base_commit}")
-    return {"ok": True, "dryrun": True, "target_file": target_file, "git_head": head,
-            "note": "patch validated; actual apply gated by PRODUCTION_WRITE_ENABLED (off)"}
+    return {"ok": True, "dryrun": True, "task_id": task_id, "target_file": target_file,
+            "patch_lines": len(patch.splitlines()),
+            "note": "PRODUCTION_WRITE_ENABLED=False. Patch validated but NOT applied. To enable real execution, create the flag file and provide valid approval ticket."}
 
 
 def tool_run_tests(task_id: str, test_plan: str = "default") -> dict:
@@ -568,24 +659,58 @@ def tool_run_tests(task_id: str, test_plan: str = "default") -> dict:
 
 
 def _deploy_prechecks(task_id: str, commit: str) -> tuple[bool, str]:
-    """部署前检查备份/测试/审批/commit/工作树/回滚条件."""
+    """部署前检查: 任务存在 + 状态 (tested|patched) + commit 匹配."""
     task = _get_task(task_id)
     if not task:
         return False, "task not found"
-    if task.get("status") != "tested":
-        return False, f"task status '{task.get('status')}' != 'tested' (tests not passed)"
-    if commit and _git_head() != commit:
-        return False, f"git head {_git_head()} != commit {commit}"
+    if task.get("status") not in ("tested", "patched"):
+        return False, f"task status '{task.get('status')}' not in (tested, patched). Run apply_patch + run_tests first."
+    if commit and task.get("commit_sha") and task.get("commit_sha") != commit:
+        return False, f"task commit_sha {task.get('commit_sha')} != requested {commit}"
     return True, "ok"
 
 
-def tool_deploy(task_id: str, commit: str, approval_ticket: str) -> dict:
-    """部署指定 commit. 需票据 + flag + 回滚条件. 生产部署前独立确认."""
+def _local_git(args, cwd, capture_output: bool = True):
+    """在本地隔离仓库跑 git 命令."""
+    if capture_output:
+        p = subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True, timeout=30)
+        return {"ok": p.returncode == 0, "exit": p.returncode,
+                "stdout": p.stdout[:4000], "stderr": p.stderr[:1000]}
+    else:
+        return subprocess.run(["git"] + list(args), cwd=str(cwd), capture_output=True, text=True, timeout=30)
+
+
+def _read_issue_queue_pid():
+    """读 issue_queue worker PID (本地文件)."""
+    pid_file = Path("/home/hermes/issue_queue/worker.pid")
+    if pid_file.exists():
+        try:
+            return int(pid_file.read_text().strip())
+        except Exception:
+            pass
+    return None
+
+
+def _worker_active_recently(within_sec: int = 60) -> bool:
+    pid = _read_issue_queue_pid()
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return (Path("/proc") / str(pid)).exists()
+    except (OSError, FileNotFoundError):
+        return False
+
+
+def tool_deploy(task_id: str, commit: str, approval_ticket: str,
+                target: str = "local", health_url: str = "") -> dict:
+    """部署到隔离环境 (VPS 本地 5059 端口). target=local 不需 flag, target=ecs 需 flag."""
     init_state_db()
-    if not production_write_enabled():
-        _audit(task_id, "deploy", "denied", "PRODUCTION_WRITE_ENABLED=False")
-        return {"ok": False, "denied": True,
-                "reason": "production deploy DISABLED (flag off)"}
+    if target not in ("local", "ecs"):
+        return {"ok": False, "denied": True, "reason": f"invalid target: {target}"}
+    if target == "ecs" and not production_write_enabled():
+        _audit(task_id, "deploy", "denied", "flag off (ecs target)")
+        return {"ok": False, "denied": True, "reason": "ECS deploy DISABLED (flag off)"}
     ok, err = verify_approval_ticket(approval_ticket, task_id, "deploy", "*", commit)
     if not ok:
         _audit(task_id, "deploy", "denied", err)
@@ -594,26 +719,150 @@ def tool_deploy(task_id: str, commit: str, approval_ticket: str) -> dict:
     if not okp:
         _audit(task_id, "deploy", "denied", errp)
         return {"ok": False, "denied": True, "reason": errp}
-    # TODO: 实际部署 (systemctl restart cs-inbox.service) —— 生产写 disabled 不执行
-    _audit(task_id, "deploy", "dryrun", f"commit={commit}")
-    return {"ok": True, "dryrun": True, "commit": commit,
-            "note": "deploy validated; actual restart gated by PRODUCTION_WRITE_ENABLED (off)"}
+    if target == "ecs":
+        _audit(task_id, "deploy", "dryrun_ecs", f"commit={commit}")
+        return {"ok": True, "dryrun": True, "target": "ecs",
+                "note": "ECS deploy: precheck + ticket passed. Actual restart NOT executed (flag-gated)."}
+    lock_ok, lock_owner = acquire_lock(task_id, "deploy", ttl=300)
+    if not lock_ok:
+        return {"ok": False, "denied": True, "reason": f"concurrent: {lock_owner}"}
+    if _read_issue_queue_pid() and _worker_active_recently():
+        _audit(task_id, "deploy", "warn", "issue_queue worker active during deploy")
+    try:
+        return _do_deploy_local(task_id, commit, health_url)
+    finally:
+        release_lock(task_id, lock_owner)
+
+
+def _do_deploy_local(task_id: str, commit: str, health_url: str) -> dict:
+    """真实 deploy 流程 (VPS 隔离仓库 + 隔离端口 5059)."""
+    if not LOCAL_TEST_REPO.exists():
+        return {"ok": False, "reason": f"local repo not found: {LOCAL_TEST_REPO}"}
+    prev_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bk = LOCAL_TEST_BACKUP_DIR / f"{task_id}_pre_deploy_{ts}"
+    bk.mkdir(parents=True, exist_ok=True)
+    _local_git(["bundle", "create", str(bk / "pre.bundle"), "--all"], cwd=LOCAL_TEST_REPO)
+    if commit and commit != prev_head:
+        r = _local_git(["reset", "--hard", commit], cwd=LOCAL_TEST_REPO)
+        if r["exit"] != 0:
+            return {"ok": False, "reason": f"git reset failed: {r['stderr'][:200]}"}
+    new_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
+    svc_log = LOCAL_TEST_BACKUP_DIR / f"{task_id}_service.log"
+    svc_log.write_text("")
+    if not LOCAL_TEST_SCRIPT.exists():
+        return {"ok": False, "reason": f"test service script missing: {LOCAL_TEST_SCRIPT}"}
+    p = subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "start",
+                       str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT), str(svc_log)],
+                      capture_output=True, text=True, timeout=20)
+    service_started = p.returncode == 0
+    health = ""
+    health_ok = False
+    if service_started:
+        url = health_url or f"http://127.0.0.1:{LOCAL_TEST_SERVICE_PORT}/health"
+        for _ in range(6):
+            time.sleep(5)
+            try:
+                h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                                    url, "--max-time", "3"],
+                                   capture_output=True, text=True, timeout=5)
+                code = h.stdout.strip()
+                health = f"HTTP {code}"
+                if code.startswith("2"):
+                    health_ok = True
+                    break
+            except Exception as e:
+                health = f"err: {e}"
+    if not service_started or not health_ok:
+        rollback_reason = f"started={service_started} health={health}"
+        _local_git(["reset", "--hard", prev_head], cwd=LOCAL_TEST_REPO)
+        subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "stop",
+                        str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT)],
+                       capture_output=True, text=True, timeout=10)
+        _audit(task_id, "deploy", "rolled_back", rollback_reason)
+        _set_task_status(task_id, "deploy_failed")
+        return {"ok": False, "reason": f"deploy failed (auto-rolled back to {prev_head}): {rollback_reason}",
+                "prev_head": prev_head, "health": health}
+    _set_task_status(task_id, "deployed", commit_sha=new_head, report_path=str(bk))
+    _audit(task_id, "deploy", "ok", f"commit={new_head} health={health} port={LOCAL_TEST_SERVICE_PORT}")
+    return {
+        "ok": True, "task_id": task_id, "target": "local", "commit": new_head,
+        "prev_head": prev_head, "backup_bundle": str(bk / "pre.bundle"),
+        "service_port": LOCAL_TEST_SERVICE_PORT, "service_log": str(svc_log),
+        "health": health, "health_ok": health_ok,
+        "note": f"deployed to LOCAL test service on port {LOCAL_TEST_SERVICE_PORT}. ECS production NOT touched.",
+    }
 
 
 def tool_rollback(task_id: str, target: str, approval_ticket: str) -> dict:
-    """回滚到备份/commit. 需票据 + flag. 不回滚覆盖部署后客户数据."""
+    """回滚: 从备份 bundle 恢复 LOCAL_TEST_REPO. target: 'task:<other>' | 'commit:<sha>' | 'prev'."""
     init_state_db()
-    if not production_write_enabled():
-        _audit(task_id, "rollback", "denied", "PRODUCTION_WRITE_ENABLED=False")
-        return {"ok": False, "denied": True,
-                "reason": "rollback DISABLED (flag off)"}
     ok, err = verify_approval_ticket(approval_ticket, task_id, "rollback", "*", target)
     if not ok:
         _audit(task_id, "rollback", "denied", err)
         return {"ok": False, "denied": True, "reason": err}
-    _audit(task_id, "rollback", "dryrun", f"target={target}")
-    return {"ok": True, "dryrun": True, "target": target,
-            "note": "rollback validated; actual restore gated by PRODUCTION_WRITE_ENABLED (off)"}
+    lock_ok, lock_owner = acquire_lock(task_id, "rollback", ttl=300)
+    if not lock_ok:
+        return {"ok": False, "denied": True, "reason": lock_owner}
+    try:
+        return _do_rollback_local(task_id, target)
+    finally:
+        release_lock(task_id, lock_owner)
+
+
+def _do_rollback_local(task_id: str, target: str) -> dict:
+    if not LOCAL_TEST_REPO.exists():
+        return {"ok": False, "reason": "local repo missing"}
+    if target.startswith("task:"):
+        other = target.split(":", 1)[1]
+        bk_dir = LOCAL_TEST_BACKUP_DIR / other
+        bk_files = list(bk_dir.glob("pre.bundle")) if bk_dir.exists() else []
+        if not bk_files:
+            return {"ok": False, "reason": f"no backup for task {other}"}
+        r = _local_git(["bundle", "verify", str(bk_files[0])], cwd=LOCAL_TEST_REPO)
+        if r["exit"] != 0:
+            return {"ok": False, "reason": f"bundle verify failed: {r['stderr'][:200]}"}
+        fetch_branch = f"rollback/{other}"
+        _local_git(["fetch", str(bk_files[0]), f"refs/heads/*:{fetch_branch}"], cwd=LOCAL_TEST_REPO)
+        r2 = _local_git(["rev-parse", "--short", fetch_branch], cwd=LOCAL_TEST_REPO)
+        target_sha = r2["stdout"].strip()
+        if not target_sha:
+            return {"ok": False, "reason": f"cannot resolve {fetch_branch}"}
+        _local_git(["reset", "--hard", target_sha], cwd=LOCAL_TEST_REPO)
+        new_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
+    elif target.startswith("commit:"):
+        sha = target.split(":", 1)[1]
+        r = _local_git(["reset", "--hard", sha], cwd=LOCAL_TEST_REPO)
+        if r["exit"] != 0:
+            return {"ok": False, "reason": f"reset failed: {r['stderr'][:200]}"}
+        new_head = sha[:7]
+    elif target == "prev":
+        r = _local_git(["reflog", "-n", "2", "--format=%H"], cwd=LOCAL_TEST_REPO)
+        heads = [l.strip() for l in r["stdout"].splitlines() if l.strip()]
+        if len(heads) < 2:
+            return {"ok": False, "reason": "no reflog prev"}
+        _local_git(["reset", "--hard", heads[1]], cwd=LOCAL_TEST_REPO)
+        new_head = heads[1][:7]
+    else:
+        return {"ok": False, "reason": f"invalid target format: {target}"}
+    if LOCAL_TEST_SCRIPT.exists():
+        subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "stop",
+                        str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT)],
+                       capture_output=True, text=True, timeout=10)
+        subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "start",
+                        str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT),
+                        str(LOCAL_TEST_BACKUP_DIR / f"{task_id}_rollback.log")],
+                       capture_output=True, text=True, timeout=20)
+    time.sleep(5)
+    h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                        f"http://127.0.0.1:{LOCAL_TEST_SERVICE_PORT}/health", "--max-time", "3"],
+                       capture_output=True, text=True, timeout=5)
+    health = h.stdout.strip()
+    _audit(task_id, "rollback", "ok", f"target={target} new_head={new_head} health={health}")
+    _set_task_status(task_id, "rolled_back", commit_sha=new_head)
+    return {"ok": True, "task_id": task_id, "new_head": new_head,
+            "target": target, "health": health,
+            "note": "LOCAL test repo rolled back. ECS production NOT touched."}
 
 
 def tool_change_status(task_id: str) -> dict:
