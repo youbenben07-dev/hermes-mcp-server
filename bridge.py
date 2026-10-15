@@ -247,6 +247,59 @@ async def health():
     return {"ok": True, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 
+# ── Stage 4.3 飞书审批回调 ─────────────────────────
+@app.get("/approval/callback")
+async def approval_callback_get(request: Request):
+    """飞书事件订阅 URL 验证 (challenge)."""
+    import hermes_approval
+    challenge = request.query_params.get("challenge", "")
+    token = request.query_params.get("token", "")
+    if hermes_approval.FEISHU_VERIFICATION_TOKEN and token != hermes_approval.FEISHU_VERIFICATION_TOKEN:
+        return JSONResponse(status_code=403, content={"error": "invalid verification token"})
+    return JSONResponse(content={"challenge": challenge})
+
+
+@app.post("/approval/callback")
+async def approval_callback_post(request: Request):
+    """飞书卡片按钮回调 (card.action.trigger). 严格校验签名 + 身份 + 防重放."""
+    import hermes_approval
+    body = await request.body()
+    ts = request.headers.get("x-lark-request-timestamp", "")
+    nonce = request.headers.get("x-lark-request-nonce", "")
+    sig = request.headers.get("x-lark-signature", "")
+    if not hermes_approval.verify_feishu_signature(ts, nonce, body, sig):
+        return JSONResponse(status_code=401, content={"error": "invalid signature"})
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid json"})
+    if data.get("type") == "url_verification":
+        return JSONResponse(content={"challenge": data.get("challenge", "")})
+    header = data.get("header", {})
+    event_id = header.get("event_id", "")
+    event_type = header.get("event_type", "")
+    if event_type != "card.action.trigger":
+        return JSONResponse(content={"ok": True, "ignored": event_type})
+    if not hermes_approval.verify_and_record_callback(event_id):
+        return JSONResponse(status_code=409, content={"error": "replay detected"})
+    event = data.get("event", {})
+    operator = event.get("operator", {})
+    open_id = operator.get("operator_id", {}).get("open_id", "")
+    action_value = event.get("action", {}).get("value", {})
+    approval_id = action_value.get("approval_id", "")
+    action = action_value.get("action", "")
+    # 身份校验: 服务端真实 open_id, 非卡片字段
+    if not hermes_approval.is_authorized_approver(open_id):
+        return JSONResponse(status_code=403, content={"error": "unauthorized approver"})
+    if action == "approve":
+        r = hermes_approval.approve(approval_id, open_id)
+    elif action == "reject":
+        r = hermes_approval.reject(approval_id, open_id)
+    else:
+        r = {"ok": False, "reason": f"unknown action: {action}"}
+    return JSONResponse(content=r)
+
+
 # ── OAuth 端点 ─────────────────────────────────────
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_metadata():

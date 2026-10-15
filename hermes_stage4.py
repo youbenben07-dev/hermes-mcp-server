@@ -414,8 +414,17 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def tool_change_plan(task_id: str, requirement: str, module: str = "") -> dict:
-    """只读检查 ECS 代码/Git/依赖/测试环境, 输出修改计划 + 风险 + 待审批操作."""
+def tool_change_plan(task_id: str, requirement: str, module: str = "",
+                     submit_approval: bool = False, operation: str = "",
+                     approver_open_id: str = "", target_env: str = "",
+                     file_list: list = None, diff_summary: str = "",
+                     db_change: str = "", downtime_risk: str = "",
+                     rollback_plan: str = "") -> dict:
+    """只读检查 ECS 代码/Git/依赖/测试环境, 输出修改计划 + 风险 + 待审批操作.
+
+    可选: submit_approval=True + operation 时, 创建待审批请求并向指定飞书用户发卡片.
+    审批通过后才由 hermes_approval.consume 签发内部票据, 不在本工具返回票据.
+    """
     init_state_db()
     # 幂等: 已存在则返回已有计划
     existing = _get_task(task_id)
@@ -460,7 +469,34 @@ def tool_change_plan(task_id: str, requirement: str, module: str = "") -> dict:
     )
     conn.commit()
     conn.close()
-    return {"ok": True, "task_id": task_id, "plan": plan}
+
+    # Stage 4.3: 可选提交审批 (创建待审批请求 + 发送飞书卡片)
+    approval_info = None
+    if submit_approval and operation:
+        import hermes_approval
+        hermes_approval.init_db()
+        ap = hermes_approval.create_approval(
+            task_id=task_id, operation=operation, target_env=target_env,
+            file_list=file_list or [], diff_summary=diff_summary,
+            risk=_assess_risk(module), db_change=db_change,
+            downtime_risk=downtime_risk, rollback_plan=rollback_plan,
+            applicant="chatgpt")
+        if ap.get("ok"):
+            approval_id = ap["approval_id"]
+            rec = hermes_approval.get_approval(approval_id)
+            target_open_id = approver_open_id or next(iter(hermes_approval.AUTHORIZED_APPROVERS), "")
+            sc = hermes_approval.send_approval_card(rec, target_open_id)
+            if sc.get("ok") and sc.get("lark_message_id"):
+                hermes_approval.record_lark_message(approval_id, sc["lark_message_id"])
+            _audit(task_id, "approval_request", "ok", f"approval_id={approval_id} op={operation}")
+            approval_info = {
+                "approval_id": approval_id, "status": "pending", "operation": operation,
+                "card_sent": sc.get("ok"), "approver_open_id": target_open_id,
+            }
+        else:
+            approval_info = {"error": ap.get("reason", "approval creation failed")}
+
+    return {"ok": True, "task_id": task_id, "plan": plan, "approval": approval_info}
 
 
 def _assess_risk(module: str) -> str:
@@ -1114,6 +1150,14 @@ def tool_change_status(task_id: str) -> dict:
         "SELECT operation, result, detail, created_at FROM audit_log WHERE task_id=? ORDER BY id DESC LIMIT 20",
         (task_id,)).fetchall()]
     conn.close()
+    # Stage 4.3: 附加审批状态
+    approvals = []
+    try:
+        import hermes_approval
+        hermes_approval.init_db()
+        approvals = hermes_approval.get_by_task(task_id)
+    except Exception as e:
+        approvals = [{"error": f"{type(e).__name__}: {e}"}]
     return {
         "ok": True,
         "task_id": task_id,
@@ -1124,6 +1168,7 @@ def tool_change_status(task_id: str) -> dict:
         "commit": task.get("commit_sha"),
         "report_path": task.get("report_path"),
         "production_write_enabled": production_write_enabled(),
+        "approvals": approvals,
         "audit_trail": logs,
     }
 
@@ -1151,9 +1196,16 @@ def _reg(name, fn, desc, input_schema, read_only=True, destructive=False):
 
 
 _reg("hermes_change_plan", tool_change_plan,
-     "Read-only inspection of ECS code/git/deps/tests, returns a change plan with file scope, risks, test plan, and pending approval operations.",
+     "Read-only inspection of ECS code/git/deps/tests, returns a change plan with file scope, risks, test plan, and pending approval operations. Optionally submit_approval creates an approval request and sends a Feishu approval card.",
      {"type": "object", "required": ["task_id", "requirement"],
-      "properties": {"task_id": {"type": "string"}, "requirement": {"type": "string"}, "module": {"type": "string"}},
+      "properties": {
+          "task_id": {"type": "string"}, "requirement": {"type": "string"}, "module": {"type": "string"},
+          "submit_approval": {"type": "boolean"}, "operation": {"type": "string"},
+          "approver_open_id": {"type": "string"}, "target_env": {"type": "string"},
+          "file_list": {"type": "array", "items": {"type": "string"}},
+          "diff_summary": {"type": "string"}, "db_change": {"type": "string"},
+          "downtime_risk": {"type": "string"}, "rollback_plan": {"type": "string"},
+      },
       "additionalProperties": False},
      read_only=True, destructive=False)
 
