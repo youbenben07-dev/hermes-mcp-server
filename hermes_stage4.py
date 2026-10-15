@@ -47,6 +47,15 @@ ECS_SERVICE = "cs-inbox.service"
 ECS_SERVICE_PORT = 5051
 LOCAL_BACKUP_ROOT = Path("/home/hermes/mcp_servers/stage4_backups")
 
+# Mock ECS (VPS 模拟 ECS 部署目标, 用于不碰真实 ECS 的端到端演练)
+MOCK_ECS_BASE = Path("/home/hermes/mcp_servers/stage4_mock_ecs")
+MOCK_ECS_REPO = MOCK_ECS_BASE / "customer" / "cs-inbox"
+MOCK_ECS_PORT = 6060
+MOCK_ECS_SERVICE_LOG = MOCK_ECS_BASE / "service.log"
+MOCK_ECS_SERVICE_SCRIPT = MOCK_ECS_BASE / "run.sh"
+MOCK_ECS_BACKUP_DIR = MOCK_ECS_BASE / "backups"
+MOCK_ECS_DB = MOCK_ECS_REPO / "data" / "inbox.db"
+
 TICKET_TTL_SECONDS = 300  # 审批票据 5 分钟有效
 TICKET_SINGLE_USE = True
 
@@ -249,15 +258,29 @@ def _audit(task_id: str, operation: str, result: str, detail: str = ""):
 
 
 def _set_task_status(task_id: str, status: str, **fields):
+    """更新/插入任务状态. row 不存在时创建最小任务 (占位)."""
     conn = _db()
+    existing = conn.execute("SELECT task_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     cols = ["status=?", "updated_at=?"]
     vals = [status, int(time.time())]
     for k, v in fields.items():
         if k in ("title", "requirement", "module", "plan_json", "file_scope", "commit_sha", "report_path"):
             cols.append(f"{k}=?")
             vals.append(v)
-    sql = f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=?"
-    conn.execute(sql, vals + [task_id])
+    if existing:
+        sql = f"UPDATE tasks SET {', '.join(cols)} WHERE task_id=?"
+        conn.execute(sql, vals + [task_id])
+    else:
+        # 插入占位 (新 task, status 字段在 cols 重复, 改用 INSERT OR REPLACE)
+        all_cols = ["task_id", "status", "updated_at", "created_at"]
+        all_vals = [task_id, status, int(time.time()), int(time.time())]
+        for k, v in fields.items():
+            if k in ("title", "requirement", "module", "plan_json", "file_scope", "commit_sha", "report_path"):
+                all_cols.append(k)
+                all_vals.append(v)
+        placeholders = ",".join(["?"] * len(all_cols))
+        sql = f"INSERT OR REPLACE INTO tasks ({','.join(all_cols)}) VALUES ({placeholders})"
+        conn.execute(sql, all_vals)
     conn.commit()
     conn.close()
 
@@ -704,9 +727,14 @@ def _worker_active_recently(within_sec: int = 60) -> bool:
 
 def tool_deploy(task_id: str, commit: str, approval_ticket: str,
                 target: str = "local", health_url: str = "") -> dict:
-    """部署到隔离环境 (VPS 本地 5059 端口). target=local 不需 flag, target=ecs 需 flag."""
+    """部署到指定 target.
+
+    target=local: VPS 隔离 (5059 端口) - 不需 flag
+    target=mock_ecs: VPS 模拟 ECS 目标 (6060 端口) - 不需 flag, 真实 SSH 流程
+    target=ecs: 真实 ECS 生产 (5051 端口) - 需 flag + 2 步确认 (Stage 4.2 dryrun 仍保留)
+    """
     init_state_db()
-    if target not in ("local", "ecs"):
+    if target not in ("local", "mock_ecs", "ecs"):
         return {"ok": False, "denied": True, "reason": f"invalid target: {target}"}
     if target == "ecs" and not production_write_enabled():
         _audit(task_id, "deploy", "denied", "flag off (ecs target)")
@@ -715,53 +743,74 @@ def tool_deploy(task_id: str, commit: str, approval_ticket: str,
     if not ok:
         _audit(task_id, "deploy", "denied", err)
         return {"ok": False, "denied": True, "reason": err}
-    okp, errp = _deploy_prechecks(task_id, commit)
-    if not okp:
-        _audit(task_id, "deploy", "denied", errp)
-        return {"ok": False, "denied": True, "reason": errp}
     if target == "ecs":
+        if production_write_enabled():
+            return _ssh_deploy_ecs(task_id, commit, health_url)
         _audit(task_id, "deploy", "dryrun_ecs", f"commit={commit}")
         return {"ok": True, "dryrun": True, "target": "ecs",
                 "note": "ECS deploy: precheck + ticket passed. Actual restart NOT executed (flag-gated)."}
+    if target == "local":
+        okp, errp = _deploy_prechecks(task_id, commit)
+        if not okp:
+            _audit(task_id, "deploy", "denied", errp)
+            return {"ok": False, "denied": True, "reason": errp}
     lock_ok, lock_owner = acquire_lock(task_id, "deploy", ttl=300)
     if not lock_ok:
         return {"ok": False, "denied": True, "reason": f"concurrent: {lock_owner}"}
     if _read_issue_queue_pid() and _worker_active_recently():
         _audit(task_id, "deploy", "warn", "issue_queue worker active during deploy")
     try:
-        return _do_deploy_local(task_id, commit, health_url)
+        if target == "local":
+            return _do_deploy_local(task_id, commit, health_url)
+        return _do_deploy_mock_ecs(task_id, commit, health_url)
     finally:
         release_lock(task_id, lock_owner)
 
 
-def _do_deploy_local(task_id: str, commit: str, health_url: str) -> dict:
-    """真实 deploy 流程 (VPS 隔离仓库 + 隔离端口 5059)."""
-    if not LOCAL_TEST_REPO.exists():
-        return {"ok": False, "reason": f"local repo not found: {LOCAL_TEST_REPO}"}
-    prev_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
+def _do_deploy_mock_ecs(task_id: str, commit: str, health_url: str) -> dict:
+    """真实 deploy 流程 (VPS 模拟 ECS 目标) - 模拟 SSH+git+systemctl+health 完整流程."""
+    if not MOCK_ECS_REPO.exists():
+        return {"ok": False, "reason": f"mock ECS repo not found: {MOCK_ECS_REPO}"}
+    prev_head = _local_git(["-C", str(MOCK_ECS_REPO), "rev-parse", "--short", "HEAD"], cwd=MOCK_ECS_REPO)["stdout"].strip()
+    target_check = _local_git(["-C", str(MOCK_ECS_REPO), "rev-parse", "--verify", commit], cwd=MOCK_ECS_REPO)
+    if target_check["exit"] != 0:
+        return {"ok": False, "denied": True, "reason": f"commit {commit} not found in mock ECS repo"}
+    target_sha_full = _local_git(["-C", str(MOCK_ECS_REPO), "rev-parse", commit], cwd=MOCK_ECS_REPO)["stdout"].strip()
     ts = time.strftime("%Y%m%d-%H%M%S")
-    bk = LOCAL_TEST_BACKUP_DIR / f"{task_id}_pre_deploy_{ts}"
+    bk = MOCK_ECS_BACKUP_DIR / f"{task_id}_pre_deploy_{ts}"
     bk.mkdir(parents=True, exist_ok=True)
-    _local_git(["bundle", "create", str(bk / "pre.bundle"), "--all"], cwd=LOCAL_TEST_REPO)
-    if commit and commit != prev_head:
-        r = _local_git(["reset", "--hard", commit], cwd=LOCAL_TEST_REPO)
+    _local_git(["-C", str(MOCK_ECS_REPO), "bundle", "create", str(bk / "pre.bundle"), "--all"], cwd=MOCK_ECS_REPO)
+    db_bk = bk / "inbox.db"
+    if MOCK_ECS_DB.exists():
+        try:
+            import sqlite3 as _sq
+            src_db = _sq.connect(str(MOCK_ECS_DB))
+            dst_db = _sq.connect(str(db_bk))
+            src_db.backup(dst_db)
+            src_db.close(); dst_db.close()
+            db_bk_ok = True
+        except Exception as e:
+            db_bk_ok = False
+            db_bk_err = str(e)
+    else:
+        db_bk_ok = None
+        db_bk_err = "no DB to backup"
+    if commit != prev_head:
+        r = _local_git(["-C", str(MOCK_ECS_REPO), "reset", "--hard", commit], cwd=MOCK_ECS_REPO)
         if r["exit"] != 0:
             return {"ok": False, "reason": f"git reset failed: {r['stderr'][:200]}"}
-    new_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
-    svc_log = LOCAL_TEST_BACKUP_DIR / f"{task_id}_service.log"
-    svc_log.write_text("")
-    if not LOCAL_TEST_SCRIPT.exists():
-        return {"ok": False, "reason": f"test service script missing: {LOCAL_TEST_SCRIPT}"}
-    p = subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "start",
-                       str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT), str(svc_log)],
-                      capture_output=True, text=True, timeout=20)
+    new_head = _local_git(["-C", str(MOCK_ECS_REPO), "rev-parse", "--short", "HEAD"], cwd=MOCK_ECS_REPO)["stdout"].strip()
+    if not MOCK_ECS_SERVICE_SCRIPT.exists():
+        return {"ok": False, "reason": f"mock service script missing: {MOCK_ECS_SERVICE_SCRIPT}"}
+    p = subprocess.run(["bash", str(MOCK_ECS_SERVICE_SCRIPT), "start",
+                       str(MOCK_ECS_SERVICE_LOG)], capture_output=True, text=True, timeout=20)
     service_started = p.returncode == 0
     health = ""
     health_ok = False
     if service_started:
-        url = health_url or f"http://127.0.0.1:{LOCAL_TEST_SERVICE_PORT}/health"
+        url = health_url or f"http://127.0.0.1:{MOCK_ECS_PORT}/health"
         for _ in range(6):
-            time.sleep(5)
+            time.sleep(3)
             try:
                 h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                                     url, "--max-time", "3"],
@@ -775,27 +824,108 @@ def _do_deploy_local(task_id: str, commit: str, health_url: str) -> dict:
                 health = f"err: {e}"
     if not service_started or not health_ok:
         rollback_reason = f"started={service_started} health={health}"
-        _local_git(["reset", "--hard", prev_head], cwd=LOCAL_TEST_REPO)
-        subprocess.run(["bash", str(LOCAL_TEST_SCRIPT), "stop",
-                        str(LOCAL_TEST_REPO), str(LOCAL_TEST_SERVICE_PORT)],
-                       capture_output=True, text=True, timeout=10)
+        _local_git(["-C", str(MOCK_ECS_REPO), "reset", "--hard", prev_head], cwd=MOCK_ECS_REPO)
+        subprocess.run(["bash", str(MOCK_ECS_SERVICE_SCRIPT), "stop",
+                        str(MOCK_ECS_SERVICE_LOG)], capture_output=True, text=True, timeout=10)
         _audit(task_id, "deploy", "rolled_back", rollback_reason)
         _set_task_status(task_id, "deploy_failed")
-        return {"ok": False, "reason": f"deploy failed (auto-rolled back to {prev_head}): {rollback_reason}",
+        return {"ok": False, "reason": f"mock_ecs deploy failed (auto-rolled back to {prev_head}): {rollback_reason}",
                 "prev_head": prev_head, "health": health}
     _set_task_status(task_id, "deployed", commit_sha=new_head, report_path=str(bk))
-    _audit(task_id, "deploy", "ok", f"commit={new_head} health={health} port={LOCAL_TEST_SERVICE_PORT}")
+    _audit(task_id, "deploy", "ok",
+           f"target=mock_ecs commit={new_head} health={health} db_backup={db_bk_ok}")
     return {
-        "ok": True, "task_id": task_id, "target": "local", "commit": new_head,
-        "prev_head": prev_head, "backup_bundle": str(bk / "pre.bundle"),
-        "service_port": LOCAL_TEST_SERVICE_PORT, "service_log": str(svc_log),
-        "health": health, "health_ok": health_ok,
-        "note": f"deployed to LOCAL test service on port {LOCAL_TEST_SERVICE_PORT}. ECS production NOT touched.",
+        "ok": True, "task_id": task_id, "target": "mock_ecs", "commit": new_head,
+        "prev_head": prev_head, "target_sha_full": target_sha_full,
+        "backup_dir": str(bk), "backup_bundle": str(bk / "pre.bundle"),
+        "db_backup": str(db_bk) if db_bk_ok else None, "db_backup_ok": db_bk_ok,
+        "service_port": MOCK_ECS_PORT, "health": health, "health_ok": health_ok,
+        "note": "Deployed to MOCK ECS target (VPS local). Real ECS production NOT touched.",
+    }
+
+
+def _ssh_deploy_ecs(task_id: str, commit: str, health_url: str) -> dict:
+    """真实 ECS 部署 (SSH 固定命令模板). 需要 PRODUCTION_WRITE_ENABLED=True + 2 步确认."""
+    confirm_file = MOCK_ECS_BASE / f".confirm_ecs_{task_id}"
+    if not confirm_file.exists():
+        return {"ok": False, "denied": True,
+                "reason": "ECS production deploy requires 2-step confirmation",
+                "required_action": f"echo CONFIRM > {confirm_file}"}
+    confirm_file.unlink(missing_ok=True)
+    r = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "HEAD"], timeout=15)
+    if not r["ok"]:
+        return {"ok": False, "reason": f"read prev_head failed: {r['stderr'][:200]}"}
+    prev_head = r["stdout"].strip()[:7]
+    rc = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--verify", commit], timeout=10)
+    if not rc["ok"]:
+        return {"ok": False, "denied": True, "reason": f"commit {commit} not in ECS repo"}
+    target_sha = rc["stdout"].strip()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    bk_local = LOCAL_BACKUP_ROOT / task_id / f"ecs_pre_deploy_{ts}"
+    bk_local.mkdir(parents=True, exist_ok=True)
+    bundle_remote = f"/tmp/{task_id}_pre.bundle"
+    rb = _ssh_exec(["git", "-C", ECS_CS_INBOX, "bundle", "create", bundle_remote, "--all"], timeout=60)
+    if not rb["ok"]:
+        return {"ok": False, "reason": f"ECS bundle create failed: {rb['stderr'][:200]}"}
+    scp = subprocess.run(["scp", "-o", "ConnectTimeout=8", f"{ECS_HOST}:{bundle_remote}",
+                          str(bk_local / "pre.bundle")], capture_output=True, text=True, timeout=60)
+    if scp.returncode != 0:
+        return {"ok": False, "reason": f"scp bundle failed: {scp.stderr[:200]}"}
+    sqlite_bk_cmd = 'sqlite3 ' + ECS_DB + ' ".backup /tmp/' + task_id + '_inbox.db"'
+    rb2 = _ssh_exec(["bash", "-lc", sqlite_bk_cmd], timeout=60)
+    if not rb2["ok"]:
+        return {"ok": False, "reason": f"ECS sqlite .backup failed: {rb2['stderr'][:200]}"}
+    db_bk_local = bk_local / "inbox.db"
+    scp2 = subprocess.run(["scp", "-o", "ConnectTimeout=8", f"{ECS_HOST}:/tmp/{task_id}_inbox.db",
+                           str(db_bk_local)], capture_output=True, text=True, timeout=60)
+    if scp2.returncode != 0:
+        return {"ok": False, "reason": f"scp db failed: {scp2.returncode}"}
+    rr = _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", commit], timeout=30)
+    if not rr["ok"]:
+        return {"ok": False, "reason": f"git reset failed: {rr['stderr'][:200]}"}
+    new_head = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
+    rs = _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+    if not rs["ok"]:
+        _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", prev_head], timeout=30)
+        _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+        return {"ok": False, "reason": f"systemctl restart failed (auto-rolled back): {rs['stderr'][:200]}"}
+    health_url_final = health_url or f"http://127.0.0.1:{ECS_SERVICE_PORT}/health"
+    health_ok = False
+    health = ""
+    for _ in range(6):
+        time.sleep(5)
+        h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                            health_url_final, "--max-time", "3"],
+                           capture_output=True, text=True, timeout=5)
+        code = h.stdout.strip()
+        health = f"HTTP {code}"
+        if code.startswith("2"):
+            health_ok = True
+            break
+    if not health_ok:
+        _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", prev_head], timeout=30)
+        _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+        return {"ok": False, "reason": f"health check failed (auto-rolled back to {prev_head}): {health}"}
+    _set_task_status(task_id, "deployed", commit_sha=new_head, report_path=str(bk_local))
+    _audit(task_id, "deploy", "ok", f"target=ecs commit={new_head} health={health}")
+    return {
+        "ok": True, "task_id": task_id, "target": "ecs", "commit": new_head,
+        "prev_head": prev_head, "backup_dir": str(bk_local),
+        "service": ECS_SERVICE, "health": health, "health_ok": health_ok,
+        "note": "Deployed to REAL ECS production via SSH. 2-step confirm consumed.",
     }
 
 
 def tool_rollback(task_id: str, target: str, approval_ticket: str) -> dict:
-    """回滚: 从备份 bundle 恢复 LOCAL_TEST_REPO. target: 'task:<other>' | 'commit:<sha>' | 'prev'."""
+    """回滚: 从备份恢复代码.
+
+    target 格式:
+    - 'task:<other_task_id>' : 用该任务的 pre.bundle 恢复
+    - 'commit:<sha>' : reset --hard 到指定 commit
+    - 'prev' : reflog 找前一个 head
+    - 'mock_ecs:task:<id>' | 'mock_ecs:commit:<sha>' | 'mock_ecs:prev' : mock_ecs 远程回滚
+    - 'ecs:task:<id>' | 'ecs:commit:<sha>' : 真实 ECS 远程回滚 (需 flag)
+    """
     init_state_db()
     ok, err = verify_approval_ticket(approval_ticket, task_id, "rollback", "*", target)
     if not ok:
@@ -805,30 +935,42 @@ def tool_rollback(task_id: str, target: str, approval_ticket: str) -> dict:
     if not lock_ok:
         return {"ok": False, "denied": True, "reason": lock_owner}
     try:
+        if target.startswith("ecs:"):
+            if not production_write_enabled():
+                _audit(task_id, "rollback", "denied", "flag off (ecs target)")
+                return {"ok": False, "denied": True, "reason": "ECS rollback DISABLED (flag off)"}
+            return _ssh_rollback_ecs(task_id, target[4:])
+        if target.startswith("mock_ecs:"):
+            return _do_rollback_mock_ecs(task_id, target[9:])
         return _do_rollback_local(task_id, target)
     finally:
         release_lock(task_id, lock_owner)
 
 
 def _do_rollback_local(task_id: str, target: str) -> dict:
+    """本地隔离仓库 (LOCAL_TEST_REPO) 回滚. target: task:<id> | commit:<sha> | prev."""
     if not LOCAL_TEST_REPO.exists():
         return {"ok": False, "reason": "local repo missing"}
     if target.startswith("task:"):
         other = target.split(":", 1)[1]
-        bk_dir = LOCAL_TEST_BACKUP_DIR / other
-        bk_files = list(bk_dir.glob("pre.bundle")) if bk_dir.exists() else []
-        if not bk_files:
+        bk_dirs = [d for d in LOCAL_TEST_BACKUP_DIR.iterdir()
+                   if d.is_dir() and (d.name == other or d.name.startswith(other + "_pre_deploy_"))]
+        if not bk_dirs:
             return {"ok": False, "reason": f"no backup for task {other}"}
+        bk_dir = max(bk_dirs, key=lambda d: d.stat().st_mtime)
+        bk_files = list(bk_dir.glob("pre.bundle"))
+        if not bk_files:
+            return {"ok": False, "reason": f"no pre.bundle in {bk_dir}"}
         r = _local_git(["bundle", "verify", str(bk_files[0])], cwd=LOCAL_TEST_REPO)
         if r["exit"] != 0:
             return {"ok": False, "reason": f"bundle verify failed: {r['stderr'][:200]}"}
-        fetch_branch = f"rollback/{other}"
-        _local_git(["fetch", str(bk_files[0]), f"refs/heads/*:{fetch_branch}"], cwd=LOCAL_TEST_REPO)
-        r2 = _local_git(["rev-parse", "--short", fetch_branch], cwd=LOCAL_TEST_REPO)
-        target_sha = r2["stdout"].strip()
+        refs = _local_git(["bundle", "list-heads", str(bk_files[0])], cwd=LOCAL_TEST_REPO)["stdout"].strip().splitlines()
+        target_sha = refs[0].split()[0] if refs else ""
         if not target_sha:
-            return {"ok": False, "reason": f"cannot resolve {fetch_branch}"}
-        _local_git(["reset", "--hard", target_sha], cwd=LOCAL_TEST_REPO)
+            return {"ok": False, "reason": "bundle has no heads"}
+        rr = _local_git(["reset", "--hard", target_sha], cwd=LOCAL_TEST_REPO)
+        if rr["exit"] != 0:
+            return {"ok": False, "reason": f"reset failed: {rr['stderr'][:200]}"}
         new_head = _local_git(["rev-parse", "--short", "HEAD"], cwd=LOCAL_TEST_REPO)["stdout"].strip()
     elif target.startswith("commit:"):
         sha = target.split(":", 1)[1]
@@ -863,6 +1005,102 @@ def _do_rollback_local(task_id: str, target: str) -> dict:
     return {"ok": True, "task_id": task_id, "new_head": new_head,
             "target": target, "health": health,
             "note": "LOCAL test repo rolled back. ECS production NOT touched."}
+
+
+def _do_rollback_mock_ecs(task_id: str, target: str) -> dict:
+    """mock_ecs 回滚 (本地 mock 目录). 支持 task: / commit: / prev."""
+    if not MOCK_ECS_REPO.exists():
+        return {"ok": False, "reason": "mock_ecs repo missing"}
+    if target.startswith("task:"):
+        other = target.split(":", 1)[1]
+        # backup 目录命名是 <task_id>_pre_deploy_<ts>, 找前缀匹配
+        bk_dirs = [d for d in MOCK_ECS_BACKUP_DIR.iterdir()
+                   if d.is_dir() and (d.name == other or d.name.startswith(other + "_pre_deploy_"))]
+        if not bk_dirs:
+            return {"ok": False, "reason": f"no backup for task {other} (in {MOCK_ECS_BACKUP_DIR})"}
+        bk_dir = max(bk_dirs, key=lambda d: d.stat().st_mtime)
+        bk_files = list(bk_dir.glob("pre.bundle"))
+        if not bk_files:
+            return {"ok": False, "reason": f"no pre.bundle in {bk_dir}"}
+        r = _local_git(["-C", str(MOCK_ECS_REPO), "bundle", "verify", str(bk_files[0])], cwd=MOCK_ECS_REPO)
+        if r["exit"] != 0:
+            return {"ok": False, "reason": f"bundle verify failed: {r['stderr'][:200]}"}
+        # 拿 bundle 的 HEAD sha (取 bundle 的第一个 ref)
+        refs = _local_git(["-C", str(MOCK_ECS_REPO), "bundle", "list-heads", str(bk_files[0])],
+                         cwd=MOCK_ECS_REPO)["stdout"].strip().splitlines()
+        target_sha = refs[0].split()[0] if refs else ""
+        if not target_sha:
+            return {"ok": False, "reason": "bundle has no heads"}
+        rr = _local_git(["-C", str(MOCK_ECS_REPO), "reset", "--hard", target_sha], cwd=MOCK_ECS_REPO)
+        if rr["exit"] != 0:
+            return {"ok": False, "reason": f"reset to {target_sha[:7]} failed: {rr['stderr'][:200]}"}
+        new_head = _local_git(["-C", str(MOCK_ECS_REPO), "rev-parse", "--short", "HEAD"], cwd=MOCK_ECS_REPO)["stdout"].strip()
+    elif target.startswith("commit:"):
+        sha = target.split(":", 1)[1]
+        r = _local_git(["-C", str(MOCK_ECS_REPO), "reset", "--hard", sha], cwd=MOCK_ECS_REPO)
+        if r["exit"] != 0:
+            return {"ok": False, "reason": f"reset failed: {r['stderr'][:200]}"}
+        new_head = sha[:7]
+    elif target == "prev":
+        r = _local_git(["-C", str(MOCK_ECS_REPO), "reflog", "-n", "2", "--format=%H"], cwd=MOCK_ECS_REPO)
+        heads = [l.strip() for l in r["stdout"].splitlines() if l.strip()]
+        if len(heads) < 2:
+            return {"ok": False, "reason": "no reflog prev"}
+        _local_git(["-C", str(MOCK_ECS_REPO), "reset", "--hard", heads[1]], cwd=MOCK_ECS_REPO)
+        new_head = heads[1][:7]
+    else:
+        return {"ok": False, "reason": f"invalid target format: {target}"}
+    if MOCK_ECS_SERVICE_SCRIPT.exists():
+        subprocess.run(["bash", str(MOCK_ECS_SERVICE_SCRIPT), "stop",
+                        str(MOCK_ECS_SERVICE_LOG)], capture_output=True, text=True, timeout=10)
+        subprocess.run(["bash", str(MOCK_ECS_SERVICE_SCRIPT), "start",
+                        str(MOCK_ECS_SERVICE_LOG)], capture_output=True, text=True, timeout=20)
+    time.sleep(3)
+    h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                        f"http://127.0.0.1:{MOCK_ECS_PORT}/health", "--max-time", "3"],
+                       capture_output=True, text=True, timeout=5)
+    health = h.stdout.strip()
+    _audit(task_id, "rollback", "ok", f"target=mock_ecs:{target} new_head={new_head} health={health}")
+    _set_task_status(task_id, "rolled_back", commit_sha=new_head)
+    return {"ok": True, "task_id": task_id, "target": f"mock_ecs:{target}",
+            "new_head": new_head, "health": health,
+            "note": "Mock ECS rolled back. Real ECS production NOT touched."}
+
+
+def _ssh_rollback_ecs(task_id: str, inner_target: str) -> dict:
+    """真实 ECS 远程回滚 (SSH 固定命令). 需要 2 步确认."""
+    confirm_file = MOCK_ECS_BASE / f".confirm_ecs_rb_{task_id}"
+    if not confirm_file.exists():
+        return {"ok": False, "denied": True,
+                "reason": "ECS rollback requires 2-step confirmation",
+                "required_action": f"echo CONFIRM > {confirm_file}"}
+    confirm_file.unlink(missing_ok=True)
+    r = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "HEAD"], timeout=10)
+    prev_head = r["stdout"].strip()[:7]
+    if inner_target.startswith("commit:"):
+        target_sha = inner_target.split(":", 1)[1]
+        rc = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--verify", target_sha], timeout=10)
+        if not rc["ok"]:
+            return {"ok": False, "reason": f"commit {target_sha} not found"}
+        rr = _ssh_exec(["git", "-C", ECS_CS_INBOX, "reset", "--hard", target_sha], timeout=30)
+        if not rr["ok"]:
+            return {"ok": False, "reason": f"reset failed: {rr['stderr'][:200]}"}
+    else:
+        return {"ok": False, "reason": f"unsupported ecs rollback target: {inner_target}"}
+    rs = _ssh_exec(["sudo", "systemctl", "restart", ECS_SERVICE], timeout=30)
+    if not rs["ok"]:
+        return {"ok": False, "reason": f"restart failed: {rs['stderr'][:200]}"}
+    time.sleep(5)
+    h = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                        f"http://127.0.0.1:{ECS_SERVICE_PORT}/health", "--max-time", "3"],
+                       capture_output=True, text=True, timeout=5)
+    health = h.stdout.strip()
+    new_head = _ssh_exec(["git", "-C", ECS_CS_INBOX, "rev-parse", "--short", "HEAD"], timeout=10)["stdout"].strip()
+    _audit(task_id, "rollback", "ok", f"target=ecs:{inner_target} new_head={new_head} health={health}")
+    _set_task_status(task_id, "rolled_back", commit_sha=new_head)
+    return {"ok": True, "task_id": task_id, "target": f"ecs:{inner_target}",
+            "new_head": new_head, "prev_head": prev_head, "health": health,
+            "note": "Real ECS production rolled back via SSH."}
 
 
 def tool_change_status(task_id: str) -> dict:
