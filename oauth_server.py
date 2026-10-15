@@ -210,12 +210,23 @@ def authorize_validate(client_id, redirect_uri, code_challenge, code_challenge_m
         conn.close()
         return None, "redirect_uri not registered", None
     conn.close()
+    requested_scope = scope or SCOPE
+    # Stage 4.5 安全: mcp:write 必须白名单授权 (防任意 OAuth client 请求写权限)
+    # 只有 auto_authorization.json 的 authorized_clients 明确列出该 client 才签发 mcp:write,
+    # 否则降级为 mcp:read (安全默认: 未启用/未授权的 client 一律只读).
+    if requested_scope == "mcp:write":
+        try:
+            import auto_authorization as _aa
+            if not _aa.is_client_authorized(client_id):
+                requested_scope = "mcp:read"
+        except Exception:
+            requested_scope = "mcp:read"
     return {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
-        "scope": scope or SCOPE,
+        "scope": requested_scope,
         "state": state or "",
     }, None, None
 

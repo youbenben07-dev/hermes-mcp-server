@@ -693,14 +693,30 @@ def tool_run_tests(task_id: str, test_plan: str = "default", repo: str = "") -> 
             capture_output=True, text=True, timeout=30,
         )
         results["syntax_check"] = {"exit": p.returncode, "stderr": p.stderr[:500]}
-        # 若有 pytest 运行 (限隔离目录)
-        if (local_repo / "tests").exists():
+        # 若有 pytest 运行 (限隔离目录).
+        # 关键: 在 tests/ 目录内跑 (cwd=tests), 避免 pytest 收集根目录 __init__.py
+        # (cs-inbox-fresh 根目录有 __init__.py + 连字符非法包名, 会导致
+        #  from sse import _sse_clients 报 unknown module).
+        # 需 PYTHONPATH 指向 repo root (顶层模块 stats_aggregator/sse/webhook).
+        # 同时 .env 自动加载 (webhook.py 顶层读 os.environ).
+        test_dir = local_repo / "tests"
+        if test_dir.exists():
+            env = {**os.environ, "PYTHONPATH": str(local_repo) + ":" + str(test_dir)
+                   + ":" + os.environ.get("PYTHONPATH", "")}
+            env_file = local_repo / ".env"
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()  # 强制覆盖, 不 setdefault
             p2 = subprocess.run(
                 ["/home/hermes/.hermes/hermes-agent/venv/bin/python3", "-m", "pytest",
-                 str(local_repo / "tests"), "-q", "--disable-warnings"],
-                capture_output=True, text=True, timeout=120,
+                 ".", "-q", "--disable-warnings", "-o", "addopts="],
+                capture_output=True, text=True, timeout=180, env=env, cwd=str(test_dir),
             )
-            results["unit_tests"] = {"exit": p2.returncode, "stdout": p2.stdout[:1000]}
+            results["unit_tests"] = {"exit": p2.returncode, "stdout": p2.stdout[:2000], "stderr": p2.stderr[:500]}
     else:
         results["error"] = f"isolated repo {local_repo} not found"
     _set_task_status(task_id, "tested")
