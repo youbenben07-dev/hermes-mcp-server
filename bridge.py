@@ -60,9 +60,9 @@ STDIO_CMD = os.environ.get("HERMES_STDIO_CMD", "/home/hermes/.hermes/hermes-agen
 STDIO_ARGS = os.environ.get("HERMES_STDIO_ARGS", "/home/hermes/mcp_servers/hermes_dev_agent.py").split()
 BRIDGE_LOG = "/home/hermes/mcp_servers/bridge.log"
 
-# MCP 协议版本
-MCP_PROTOCOL_VERSION = "2025-06-18"
-SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+# MCP 协议版本 (Stage 3.7.2: 支持 2026-07-28 - ChatGPT 实际用的)
+MCP_PROTOCOL_VERSION = "2026-07-28"  # 最新版 (ChatGPT 用)
+SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"}
 
 if not TOKEN:
     if os.path.exists(DEFAULT_TOKEN_FILE):
@@ -171,7 +171,7 @@ app = FastAPI(title="Hermes MCP Remote Bridge (Stage 3.7)", version="3.7.0")
 
 class JsonRpcRequest(BaseModel):
     jsonrpc: str = "2.0"
-    id: Optional[int] = None
+    id: Optional[object] = None  # JSON-RPC 允许 string/int/null
     method: str
     params: Optional[dict] = None
 
@@ -354,55 +354,109 @@ async def mcp_get():
     )
 
 
+def _validate_origin(request: Request) -> bool:
+    """MCP 2026-07-28 spec 强制: 验证 Origin 防 DNS rebinding.
+    我们允许: chatgpt.com / chat.openai.com / openai.com / localhost.
+    没有 Origin 头通常意味着非浏览器 client (curl/SDK), 也允许."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return True  # 非浏览器 client
+    allowed_suffixes = ("chatgpt.com", "openai.com", "localhost", "toothingbeginning.com", "hermes", "127.0.0.1")
+    return any(origin.endswith(s) or s in origin for s in allowed_suffixes)
+
+
 @app.post("/mcp")
 async def mcp_post(req: JsonRpcRequest, request: Request):
+    # Origin 验证 (MCP 2026-07-28 强制)
+    if not _validate_origin(request):
+        log(f"[mcp] Origin BLOCKED: {request.headers.get('origin')}")
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"code": -32000, "message": "Invalid Origin header (DNS rebinding protection)"}},
+        )
+
+    # server/discover (2026-07-28 新方法) - 必须在 check_auth 之前, 不需 auth
+    if req.method == "server/discover":
+        client = "anonymous[discover]"
+        # 局部算 use_sse (不能引用后面的)
+        accept_hdr = request.headers.get("accept", "application/json")
+        use_sse_discover = "text/event-stream" in accept_hdr
+        result = {
+            "resultType": "complete",
+            "supportedVersions": sorted(SUPPORTED_PROTOCOL_VERSIONS),
+            "capabilities": {
+                "tools": {},
+            },
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "hermes-dev-agent",
+                    "version": "3.7.2",
+                }
+            },
+            "instructions": "Hermes Dev Agent 提供 5 个只读 MCP 工具: hermes_system_status, hermes_ecs_shell, hermes_read_file, hermes_git_status, hermes_logs. 所有工具只读, 无副作用. 通过 OAuth 2.1 access_token (scope mcp:read) 认证.",
+            "ttlMs": 3600000,
+            "cacheScope": "public",
+        }
+        resp = {"jsonrpc": "2.0", "id": req.id, "result": result}
+        resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        log(f"[mcp] {client} -> server/discover")
+        return Response(
+            content=json.dumps(resp),
+            media_type="text/event-stream" if use_sse_discover else "application/json",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
+    # 认证 (其他方法必须 auth)
     client = check_auth(request)
 
-    # MCP-Protocol-Version 头协商 (2025-06-18 spec)
+    # MCP-Protocol-Version 头协商 (2026-07-28 强制)
     client_proto = request.headers.get("mcp-protocol-version")
     proto_version = client_proto if client_proto in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
 
-    # Accept 头 (text/event-stream 允许, 2025-06-18 spec)
+    # Accept 头 (text/event-stream 允许, 2026-07-28 spec)
     accept = request.headers.get("accept", "application/json")
     use_sse = "text/event-stream" in accept
 
+    # Mcp-Method 头 (2026-07-28 新增, 反映 JSON-RPC method 字段)
+    mcp_method_header = req.method
+
+    # 调试: 记所有 headers (生产可关)
+    if req.method not in ("ping",):
+        ua = request.headers.get("user-agent", "?")[:60]
+        origin = request.headers.get("origin", "-")
+        log(f"[mcp] {client} -> {req.method} (proto={proto_version}, origin={origin}, ua={ua!r})")
+
+    # server/discover 已在 check_auth 之前处理 (见上面), 到这里已不会执行
+    # (此 block 留为防御性 - 不应到达)
+
     # notifications/initialized: 202 no body, 不转发 stdio
     if req.method == "notifications/initialized":
-        sid = request.headers.get("mcp-session-id")
-        if sid and sid in sessions:
-            mark_session_initialized(sid)
-        log(f"[mcp] {client} -> notifications/initialized (sid={sid[:8] if sid else 'new'}...)")
+        log(f"[mcp] {client} -> notifications/initialized")
         return Response(status_code=202)
 
-    # initialize: 生成 session + 立即返回 serverInfo
+    # initialize: 返回 serverInfo + 兼容所有协议版本
     if req.method == "initialize":
-        sid = get_or_create_session(request, client)
-        # 从 stdio 拿 serverInfo, 但覆盖 protocolVersion
         resp = await stdio_mcp.call(req.dict(exclude_none=True), timeout=15)
         if isinstance(resp, dict) and "result" in resp:
+            # 用 client 协议的版本 (client 优先)
             resp["result"]["protocolVersion"] = proto_version
+            # 确保 serverInfo 完整
+            if "serverInfo" not in resp["result"]:
+                resp["result"]["serverInfo"] = {"name": "hermes-dev-agent", "version": "3.7.2"}
             resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        log(f"[mcp] {client} -> initialize (proto={proto_version}, sid={sid[:8]}...)")
         return Response(
             content=json.dumps(resp),
             media_type="text/event-stream" if use_sse else "application/json",
-            headers={"Mcp-Session-Id": sid},
+            headers={"X-Accel-Buffering": "no"},
         )
 
-    # 其他 JSON-RPC: 检查 session (initialized 之后才能调业务)
+    # 其他 JSON-RPC: 2026-07-28 移除 session, 但仍兼容旧版
     sid = request.headers.get("mcp-session-id")
-    if not sid or sid not in sessions:
-        # 2025-06-18 允许 stateless, 但 ChatGPT 通常带 sid
-        pass
-    if sid and sid in sessions and not sessions[sid].get("initialized"):
-        # 已给 sid 但没 initialized, 拒绝业务方法
-        if req.method not in ("ping",):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"code": -32600, "message": "session not initialized; call notifications/initialized first"}},
-            )
+    # 旧协议 session 检查 (已宽松, 不再强制 initialized)
+    # if sid and sid in sessions and not sessions[sid].get("initialized"):
+    #     if req.method not in ("ping",):
+    #         return JSONResponse(...)
 
-    log(f"[mcp] {client} -> {req.method} (id={req.id}, sid={sid[:8] if sid else 'none'}...)")
     resp = await stdio_mcp.call(req.dict(exclude_none=True), timeout=30)
     if isinstance(resp, dict) and "result" in resp:
         resp["_audit"] = {"client": client, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
@@ -410,6 +464,7 @@ async def mcp_post(req: JsonRpcRequest, request: Request):
     return Response(
         content=json.dumps(resp),
         media_type="text/event-stream" if use_sse else "application/json",
+        headers={"X-Accel-Buffering": "no"},
     )
 
 
